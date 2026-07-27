@@ -2,10 +2,7 @@
 
 A standalone Python pipeline that turns an OSS-Fuzz bug report into a new
 FuzzingBrain-Bench challenge (a bug bundle in the private answers repo, plus a
-scrubbed challenge entry in the public bench repo). Plain Python, no Claude
-Code Workflow tool involved — deterministic steps (git/docker/curl/YAML edits)
-run as ordinary subprocess calls, and steps that genuinely need judgment call
-out to **Claude** via a headless `claude -p` subprocess (`agent.py`).
+scrubbed challenge entry in the public bench repo).
 
 - `AddVulnSOP/pipeline.py` — the orchestrator. Runs the stages below in order
   and persists state to `<report-dir>/.pipeline_state.json`, so a long run
@@ -16,6 +13,10 @@ out to **Claude** via a headless `claude -p` subprocess (`agent.py`).
 - `AddVulnSOP/*.py` (everything else) — deterministic helper modules the
   orchestrator calls (git/docker/corpus-scan/YAML-generation logic). Each is
   also a standalone CLI (`argparse` + JSON on the last line of stdout).
+- `report.example/` — a real worked example (`report.txt` + PoC + the
+  resulting `.pipeline_state.json` from a completed run) to see what a full
+  run looks like without having to run one yourself.
+- `requirements.txt` — this repo's own Python dependencies (just PyYAML).
 - Standalone: not a submodule of either bench repo, not itself a git repo
   dependency of them — it only touches them via explicit
   `--answers-repo`/`--public-repo`/`--oss-fuzz-repo` paths (default: sibling
@@ -24,11 +25,33 @@ out to **Claude** via a headless `claude -p` subprocess (`agent.py`).
   repo's `README.md` / `tools/sealed/CHALLENGES.md` — both are shared,
   cross-bug documentation the user updates by hand.
 
+## Workspace layout
+
+Expects four sibling directories under one parent (paths are overridable, see
+below, but this is the default):
+
+```
+workspace/
+├── FuzzingBrain-Bench/            # bench repo (public)
+├── FuzzingBrain-Bench-answers/    # answer repo (private)
+├── FuzzingBrain-Benchmark-add_vuln_sop/   # sop repo (this repo)
+└── oss-fuzz/                      # ossfuzz repo (google/oss-fuzz checkout)
+```
+
+## Setup
+
+```
+pip install -r requirements.txt
+```
+
+Also needs on `PATH`: `git`, `docker` (logged in if you intend to push
+images), `curl`, and the `claude` CLI (logged in — used headlessly via
+`claude -p`).
+
 ## Usage
 
-Clone this repo as a sibling of `FuzzingBrain-Bench`, `FuzzingBrain-Bench-answers`,
-and a `google/oss-fuzz` checkout. Drop a bug report bundle (typically
-`report.txt` + a PoC file) into any directory, then run:
+Drop a bug report bundle (typically `report.txt` + a PoC file, see
+`report.example/`) into any directory, then run:
 
 ```
 python3 AddVulnSOP/pipeline.py run --report-dir /path/to/report
