@@ -13,9 +13,8 @@ scrubbed challenge entry in the public bench repo).
 - `AddVulnSOP/*.py` (everything else) — deterministic helper modules the
   orchestrator calls (git/docker/corpus-scan/YAML-generation logic). Each is
   also a standalone CLI (`argparse` + JSON on the last line of stdout).
-- `report.example/` — a real worked example (`report.txt` + PoC + the
-  resulting `.pipeline_state.json` from a completed run) to see what a full
-  run looks like without having to run one yourself.
+- `report.example/` — a real worked example (`report.txt` + PoC) of a bug
+  report bundle, showing the expected input format.
 - `requirements.txt` — this repo's own Python dependencies (just PyYAML).
 - Standalone: not a submodule of either bench repo, not itself a git repo
   dependency of them — it only touches them via explicit
@@ -51,7 +50,11 @@ images), `curl`, and the `claude` CLI (logged in — used headlessly via
 ## Usage
 
 Drop a bug report bundle (typically `report.txt` + a PoC file, see
-`report.example/`) into any directory, then run:
+`report.example/`) into any directory. `report.txt` should lead with an
+`upstream: <issue-url>` and `date: <report-filed-date>` header (before the
+raw OSS-Fuzz report text) — the `date` in particular lets `resolve_vuln_commit`
+resolve `vuln_commit` directly from the report's filed date instead of falling
+back to a much more expensive bisection. Then run:
 
 ```
 python3 AddVulnSOP/pipeline.py run --report-dir /path/to/report
