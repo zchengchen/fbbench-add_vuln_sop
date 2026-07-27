@@ -117,6 +117,16 @@ def run_harness_once(binary: Path, invocation: list | None, poc_path: Path,
         env["UBSAN_OPTIONS"] = UBSAN_OPTIONS
         env["LSAN_OPTIONS"] = LSAN_OPTIONS
         env["TMPDIR"] = str(rundir)
+        # Without this, ASan silently fails to symbolize ("invalid path to
+        # external symbolizer!") even when a compatible llvm-symbolizer/
+        # addr2line exists on PATH -- it does NOT auto-search PATH on its
+        # own. Every caller of run_harness_once() depends on symbolized
+        # file:line frames (gen_expected_yaml.py's reach/site derivation,
+        # corpus_scan.py's SUMMARY-based dedup), so this is not optional.
+        if not env.get("ASAN_SYMBOLIZER_PATH"):
+            symbolizer = shutil.which("llvm-symbolizer") or shutil.which("addr2line")
+            if symbolizer:
+                env["ASAN_SYMBOLIZER_PATH"] = symbolizer
         if env_extra:
             env.update(env_extra)
         args = [str(binary)] + [str(poc_path) if a == "@@" else a for a in (invocation or ["@@"])]
