@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fallback for the first bug ever added for a project (find_sibling_bundle.py
-reported found: false): mechanically derive a bug-bundle Dockerfile +
-harness/build.sh from the oss-fuzz project's own build definition, without
-authoring any new harness/fuzz-target source.
+reported found: false): mechanically derive a bug-bundle build/Dockerfile +
+build/build.sh from the oss-fuzz project's own build definition, without
+authoring any new harness/fuzz-target source. (The returned `harness_build_sh`
+text is written by the caller to the bug's build/build.sh; harness/ holds only
+the harness source.)
 
 This is a best-effort translator, not a build-system compiler: oss-fuzz
 projects use autoconf/cmake/meson/plain-make/delegated-scripts, and this
@@ -208,16 +210,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 RUN git clone {repo_url} /src/{project} \\
  && git -C /src/{project} checkout ${{VULN_COMMIT}}
 
-COPY harness/build.sh /src/harness/build.sh
-RUN chmod +x /src/harness/build.sh
+COPY harness/ /src/harness/
+COPY build/build.sh /src/build/build.sh
+RUN chmod +x /src/build/build.sh
 
-RUN /src/harness/build.sh build-libs
+RUN /src/build/build.sh build-libs
 
 RUN mkdir -p /out \\
- && /src/harness/build.sh harness debug \\
- && /src/harness/build.sh harness debug-asan \\
- && /src/harness/build.sh harness release-asan \\
- && /src/harness/build.sh harness coverage
+ && /src/build/build.sh harness debug \\
+ && /src/build/build.sh harness debug-asan \\
+ && /src/build/build.sh harness release-asan \\
+ && /src/build/build.sh harness coverage
 
 RUN ls -la /out/*/harness
 """
@@ -315,7 +318,7 @@ exit 2
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Mechanically derive a bug-bundle Dockerfile + harness/build.sh from an "
+        description="Mechanically derive a bug-bundle build/Dockerfile + build/build.sh from an "
                     "oss-fuzz project's own build definition (no new harness code authored)."
     )
     ap.add_argument("--oss-fuzz-repo", default=None, help="override path to google/oss-fuzz checkout")

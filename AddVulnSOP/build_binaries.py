@@ -71,7 +71,7 @@ def _stage_patched_context(bug_dir: Path, fix_commit: str, patch: Path) -> Path:
     shutil.copytree(bug_dir, tmp_ctx, dirs_exist_ok=True,
                      ignore=shutil.ignore_patterns("binaries", "binaries/*"))
 
-    dockerfile_path = tmp_ctx / "Dockerfile"
+    dockerfile_path = tmp_ctx / "build" / "Dockerfile"
     dockerfile_text = dockerfile_path.read_text(encoding="utf-8")
     start, end, repo_dest = _find_clone_block(dockerfile_text)
 
@@ -100,7 +100,8 @@ def build_config(bug_dir: Path, config: str, vuln_commit: str | None, fix_commit
 
     try:
         if config in ("release-asan", "coverage"):
-            build_result = lib.docker_build(bug_dir, tag=tag, build_args={"VULN_COMMIT": vuln_commit})
+            build_result = lib.docker_build(bug_dir, tag=tag, build_args={"VULN_COMMIT": vuln_commit},
+                                             dockerfile=bug_dir / "build" / "Dockerfile")
             out_config = config
         else:  # fixed-asan
             if patch is not None:
@@ -108,7 +109,8 @@ def build_config(bug_dir: Path, config: str, vuln_commit: str | None, fix_commit
                 context = tmp_ctx
             else:
                 context = bug_dir
-            build_result = lib.docker_build(context, tag=tag, build_args={"VULN_COMMIT": fix_commit})
+            build_result = lib.docker_build(context, tag=tag, build_args={"VULN_COMMIT": fix_commit},
+                                             dockerfile=context / "build" / "Dockerfile")
             out_config = "release-asan"  # fixed-asan only ever needs the release-asan-equivalent build
 
         result = {
@@ -160,8 +162,8 @@ def main():
     if not bug_dir.is_dir():
         print(f"error: no such bug directory: {bug_dir}", file=sys.stderr)
         raise SystemExit(2)
-    if not (bug_dir / "Dockerfile").is_file():
-        print(f"error: no Dockerfile at {bug_dir}/Dockerfile", file=sys.stderr)
+    if not (bug_dir / "build" / "Dockerfile").is_file():
+        print(f"error: no Dockerfile at {bug_dir}/build/Dockerfile", file=sys.stderr)
         raise SystemExit(2)
 
     if args.config in ("release-asan", "coverage") and not args.vuln_commit:

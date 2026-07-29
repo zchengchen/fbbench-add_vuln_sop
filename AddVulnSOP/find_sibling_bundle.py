@@ -21,24 +21,37 @@ def _read_text_or_none(path) -> str | None:
 
 
 def _sibling_bench(bug_dir) -> dict:
-    """Best-effort extraction of the project-level bits of bench.yaml that
-    don't depend on which specific bug triggered them. Never raises --
-    returns {} on anything missing/malformed."""
+    """Best-effort extraction of the project-level bits that don't depend on
+    which specific bug triggered them. Never raises -- returns {} on anything
+    missing/malformed.
+
+    Post-refactor split: the public `bench.yaml` is minimal (bug_id, project,
+    is_oss_fuzz, top-level language, harness.{sanitizer,engine,invocation});
+    everything else (repo, capability_set, ...) moved to the hidden `vuln.yaml`.
+    So `language`/`harness` come from bench.yaml, `repo`/`capability_set` from
+    vuln.yaml (metadata.repo / top-level capability_set)."""
     bench_path = bug_dir / "bench.yaml"
     if not bench_path.is_file():
         return {}
+    out: dict = {}
     try:
         data = lib.read_yaml(bench_path)
-        target = data.get("target") or {}
-        return {
-            "language": target.get("language"),
-            "build_system": target.get("build_system"),
-            "repo": target.get("repo"),
+        out = {
+            "language": data.get("language"),
+            "is_oss_fuzz": data.get("is_oss_fuzz"),
             "harness": data.get("harness") or {},
-            "capability_set": data.get("capability_set") or [],
         }
     except Exception:
         return {}
+    vuln_path = bug_dir / "vuln.yaml"
+    if vuln_path.is_file():
+        try:
+            v = lib.read_yaml(vuln_path)
+            out["repo"] = (v.get("metadata") or {}).get("repo")
+            out["capability_set"] = v.get("capability_set") or []
+        except Exception:
+            pass
+    return out
 
 
 def find_sibling(answers_repo, project: str) -> dict:
@@ -46,9 +59,11 @@ def find_sibling(answers_repo, project: str) -> dict:
     if not project_dir.is_dir():
         return {"found": False}
 
+    # Post-refactor layout: the build recipe lives in build/ (build/Dockerfile
+    # + build/build.sh); harness/ now holds only the harness SOURCE files.
     candidates = sorted(
         p.name for p in project_dir.iterdir()
-        if p.is_dir() and (p / "Dockerfile").is_file() and (p / "harness" / "build.sh").is_file()
+        if p.is_dir() and (p / "build" / "Dockerfile").is_file() and (p / "build" / "build.sh").is_file()
     )
     if not candidates:
         return {"found": False}
@@ -56,7 +71,8 @@ def find_sibling(answers_repo, project: str) -> dict:
     sibling_bug_id = candidates[0]
     sibling_dir = project_dir / sibling_bug_id
 
-    dockerfile_text = _read_text_or_none(sibling_dir / "Dockerfile")
+    dockerfile_text = _read_text_or_none(sibling_dir / "build" / "Dockerfile")
+    build_sh_text = _read_text_or_none(sibling_dir / "build" / "build.sh")
 
     harness_dir = sibling_dir / "harness"
     harness_files = {}
@@ -70,6 +86,7 @@ def find_sibling(answers_repo, project: str) -> dict:
         "found": True,
         "sibling_bug_id": sibling_bug_id,
         "dockerfile": dockerfile_text,
+        "build_sh": build_sh_text,
         "harness_files": harness_files,
         "sibling_bench": _sibling_bench(sibling_dir),
     }

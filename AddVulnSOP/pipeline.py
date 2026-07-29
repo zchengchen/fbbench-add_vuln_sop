@@ -196,15 +196,11 @@ PARSE_REPORT_SCHEMA = {
                             "filing time -- do not discard it.",
         },
         "poc_filename": {"type": ["string", "null"], "description": "filename of the PoC in the report dir"},
-        "descriptive_bug_id": {
-            "type": "string",
-            "description": "kebab-case id describing the bug (NOT the crash function alone), e.g. "
-                            "'libxml2-attr-id-uaf'. Never mentions a CVE number.",
-        },
-        "short_title": {"type": "string", "description": "one-line human title for bench.yaml"},
+        "short_title": {"type": "string", "description": "one-line human title (used in description.txt prose; "
+                        "the neutral bug id is <project>-NN, assigned by compute_alias, NOT authored here)"},
     },
     "required": ["project", "fuzz_target", "crash_type", "crash_state_functions",
-                 "descriptive_bug_id", "short_title", "sanitizer"],
+                 "short_title", "sanitizer"],
 }
 
 
@@ -359,7 +355,10 @@ def stage_resolve_vuln_commit(ctx: Ctx, state: dict) -> dict:
             "--repo-url", clone["repo_url"], "--clone-dir", clone_dir,
         ], timeout_s=600)
         return {"data": {
-            "vuln_commit": rc["vuln_commit"], "fix_commit": None,
+            # resolve_vuln_fix_commits.py now emits the resolved commit as
+            # `vuln_version` (its vuln.yaml home); we keep the pipeline-internal
+            # key `vuln_commit` and only rename it at the vuln.yaml write site.
+            "vuln_commit": rc["vuln_version"], "fix_commit": None,
             "confirmed_signature_match": None, "notes": "unfixed upstream; vuln_commit=HEAD",
         }}
 
@@ -433,16 +432,19 @@ Do not stop at a plausible-looking commit without actually running the tool agai
 def stage_compute_alias(ctx: Ctx, state: dict) -> dict:
     report = stage_data(state, "parse_report")
     project = report["project"]
-    bug_id = report["descriptive_bug_id"]
+    # Unified identity: dir name == bug_id == public alias == <project>-NN.
+    # compute_alias.py returns the next sequential id; there is no separate
+    # descriptive id to feed in.
     out = run_tool("compute_alias.py", [
-        "--project", project, "--new-bug-id", bug_id,
-        "--answers-repo", str(ctx.answers_repo),
+        "--project", project, "--answers-repo", str(ctx.answers_repo),
     ])
+    bug_id = out["bug_id"]
     bug_dir = ctx.answers_repo / "bugs" / project / bug_id
     bug_dir.mkdir(parents=True, exist_ok=True)
-    (bug_dir / "harness").mkdir(exist_ok=True)
-    (bug_dir / "poc").mkdir(exist_ok=True)
-    (bug_dir / "grader").mkdir(exist_ok=True)
+    # New per-bug layout: build/ (Dockerfile + build.sh), harness/ (source),
+    # poc/ (poc.bin only), grader/ (expected.yaml), utils/ (generators).
+    for sub in ("build", "harness", "poc", "grader", "utils"):
+        (bug_dir / sub).mkdir(exist_ok=True)
     out["bug_dir"] = str(bug_dir)
     return {"data": out}
 
@@ -450,15 +452,36 @@ def stage_compute_alias(ctx: Ctx, state: dict) -> dict:
 # ---------------------------------------------------------------------------
 # STAGE 6: scaffold_harness (find_sibling_bundle.py reuse, else
 # derive_dockerfile.py fallback, agent finalizes/adapts for this bug's own
-# fuzz target and writes Dockerfile + harness/build.sh into the bug dir).
+# fuzz target and writes build/Dockerfile + build/build.sh + harness/ source).
 
 SCAFFOLD_HARNESS_SCHEMA = {
     "type": "object",
     "properties": {
         "ok": {"type": "boolean"},
         "warnings": {"type": "array", "items": {"type": "string"}},
+        "harness_meta": {
+            "type": "object",
+            "description": "the harness/build facts you just encoded -- used verbatim to generate the "
+                           "answers bench.yaml (minimal), vuln.yaml, and the public bench.yaml. Report "
+                           "what you actually wrote, not a guess.",
+            "properties": {
+                "language": {"type": "string", "description": "c | cpp | jvm"},
+                "build_system": {"type": "string", "description": "autoconf|cmake|meson|maven|make|handrolled|..."},
+                "harness_type": {"type": "string", "description": "libfuzzer | java"},
+                "entrypoint": {"type": "string", "description": "LLVMFuzzerTestOneInput, or <Class>.fuzzerTestOneInput for jvm"},
+                "engine": {"type": "string", "description": "libfuzzer | jazzer"},
+                "sanitizer": {"type": "string", "description": "the crash ORACLE that captures the bug: asan|ubsan|libfuzzer|jazzer"},
+                "invocation": {"type": "array", "items": {"type": "string"}, "description": 'e.g. ["-rss_limit_mb=256","@@"] or ["@@"]'},
+                "rss_limit_mb": {"type": ["integer", "null"]},
+                "timeout_s": {"type": ["integer", "null"]},
+                "provenance": {"type": "string", "description": "oss-fuzz if the fuzz target is upstream's own; fuzzingbrain if hand-authored"},
+                "is_oss_fuzz": {"type": "boolean", "description": "true if this bug's fuzz target is an official OSS-Fuzz target"},
+            },
+            "required": ["language", "build_system", "harness_type", "entrypoint", "engine",
+                         "sanitizer", "invocation", "provenance", "is_oss_fuzz"],
+        },
     },
-    "required": ["ok"],
+    "required": ["ok", "harness_meta"],
 }
 
 
@@ -476,11 +499,12 @@ def stage_scaffold_harness(ctx: Ctx, state: dict) -> dict:
     if sibling.get("found"):
         reference = (
             f"An existing sibling bug bundle for this project was found (bug_id={sibling['sibling_bug_id']}). "
-            f"Its Dockerfile:\n```\n{sibling['dockerfile']}\n```\n"
-            f"Its harness/build.sh:\n```\n{sibling['harness_files'].get('build.sh', '')}\n```\n"
-            f"Sibling bench.yaml harness/target metadata: {json.dumps(sibling['sibling_bench'])}\n"
+            f"Its build/Dockerfile:\n```\n{sibling['dockerfile']}\n```\n"
+            f"Its build/build.sh:\n```\n{sibling.get('build_sh') or ''}\n```\n"
+            f"Its harness/ source files: {json.dumps(sorted((sibling.get('harness_files') or {}).keys()))}\n"
+            f"Sibling bench.yaml/vuln.yaml metadata: {json.dumps(sibling['sibling_bench'])}\n"
             f"This new bug's fuzz target is '{report['fuzz_target']}', which may DIFFER from the "
-            f"sibling's fuzz target -- adapt the harness/build.sh to build and link the correct "
+            f"sibling's fuzz target -- adapt build/build.sh to build and link the correct "
             f"OSS-Fuzz fuzz-target source for '{report['fuzz_target']}' (inspect the cloned repo at "
             f"{clone['clone_dir']} -- likely under fuzz/ -- and how the project's own "
             f"fuzz/oss-fuzz-build.sh or build.sh compiles/links that specific target) rather than "
@@ -493,27 +517,35 @@ def stage_scaffold_harness(ctx: Ctx, state: dict) -> dict:
         ])
         reference = (
             f"No existing sibling bundle for this project. A mechanically-derived best-effort draft "
-            f"(may contain TODO placeholders -- see warnings) is:\nDockerfile:\n```\n{derived['dockerfile']}\n```\n"
-            f"harness/build.sh:\n```\n{derived['harness_build_sh']}\n```\n"
+            f"(may contain TODO placeholders -- see warnings) is:\nbuild/Dockerfile:\n```\n{derived['dockerfile']}\n```\n"
+            f"build/build.sh:\n```\n{derived['harness_build_sh']}\n```\n"
             f"Generator warnings: {derived.get('warnings')}\n"
             f"Resolve every TODO by inspecting the cloned repo at {clone['clone_dir']} and the "
             f"oss-fuzz project files at {ctx.oss_fuzz_repo / 'projects' / project}."
         )
 
-    prompt = f"""Write bugs/{project}/{bug_dir.name}/Dockerfile and harness/build.sh (relative to your \
-cwd, which IS that bug directory) for a new challenge bundle. VULN_COMMIT must be {vuln_commit}. \
-SOURCE_DATE_EPOCH must be 1735689600. Fuzz target: '{report['fuzz_target']}'. Build system: mirror \
-whatever this project actually uses.
+    prompt = f"""Write build/Dockerfile and build/build.sh (relative to your cwd, which IS that bug \
+directory {bug_dir.name}) for a new challenge bundle, and place any harness SOURCE files under harness/. \
+VULN_COMMIT must be {vuln_commit}. SOURCE_DATE_EPOCH must be 1735689600. Fuzz target: \
+'{report['fuzz_target']}'. Build system: mirror whatever this project actually uses.
+
+Per-bug layout (post-refactor): build/Dockerfile + build/build.sh hold the build recipe; harness/ holds \
+ONLY the harness source (e.g. harness.c / Harness.java), never build.sh.
 
 {reference}
 
-The Dockerfile must clone https://github.com/... or the project's real upstream URL ({clone['repo_url']}) \
-at ${{VULN_COMMIT}}, COPY harness/build.sh, then RUN build-libs and RUN harness for debug, debug-asan, \
-release-asan, coverage configs -- mirror the exact shape/flags of the reference above unless this \
-project's build system genuinely differs. harness/build.sh must implement the `build-libs` / \
-`harness <config>` subcommand contract (see reference). You have Bash access to explore the cloned repo \
-at {clone['clone_dir']} (read-only exploration is fine; do not modify it) to confirm the real fuzz-target \
-source path and its exact compile/link flags before writing the harness script -- do not guess."""
+The build/Dockerfile must clone the project's real upstream URL ({clone['repo_url']}) at ${{VULN_COMMIT}}, \
+then `COPY harness/ /src/harness/` and `COPY build/build.sh /src/build/build.sh`, then RUN build-libs and \
+RUN harness for debug, debug-asan, release-asan, coverage configs (all invoked as /src/build/build.sh ...) \
+-- mirror the exact shape/flags of the reference above unless this project's build system genuinely \
+differs. build/build.sh must implement the `build-libs` / `harness <config>` subcommand contract (see \
+reference). You have Bash access to explore the cloned repo at {clone['clone_dir']} (read-only exploration \
+is fine; do not modify it) to confirm the real fuzz-target source path and its exact compile/link flags \
+before writing the build script -- do not guess.
+
+Finally, report `harness_meta` describing exactly what you encoded (language, build_system, harness_type, \
+entrypoint, engine, sanitizer, invocation, rss_limit_mb, timeout_s, provenance, is_oss_fuzz). These drive \
+the generated bench.yaml/vuln.yaml, so they must match the build/Dockerfile + build/build.sh you wrote."""
 
     out = call_agent(
         prompt, cwd=bug_dir,
@@ -525,8 +557,8 @@ source path and its exact compile/link flags before writing the harness script -
         extra_args=["--add-dir", clone["clone_dir"]],
     )
     data = out["structured_output"] or {"ok": False, "warnings": ["no structured_output returned"]}
-    if not (bug_dir / "Dockerfile").is_file() or not (bug_dir / "harness" / "build.sh").is_file():
-        raise RuntimeError(f"scaffold_harness: agent did not write Dockerfile/harness/build.sh: {out['result']!r}")
+    if not (bug_dir / "build" / "Dockerfile").is_file() or not (bug_dir / "build" / "build.sh").is_file():
+        raise RuntimeError(f"scaffold_harness: agent did not write build/Dockerfile + build/build.sh: {out['result']!r}")
     return {"data": data, "cost_usd": out["cost_usd"]}
 
 
@@ -614,10 +646,11 @@ HANDLE_ANOMALY_SCHEMA = {
     "type": "object",
     "properties": {
         "needs_patch": {"type": "boolean", "description": "true only for scenario (a): a local "
-                        "tools/fixes/ patch applied to fixed-asan only"},
-        "patch_relpath": {"type": ["string", "null"], "description": "relative to the answers repo root"},
+                        "patch/patch.diff applied to the fixed-asan build only"},
+        "patch_relpath": {"type": ["string", "null"], "description": "path to the written patch, relative "
+                          "to the bug dir -- always 'patch/patch.diff'"},
         "harness_build_modified": {"type": "boolean", "description": "true if you directly edited "
-                                   "harness/build.sh (scenario (b)) -- both release-asan and fixed-asan "
+                                   "build/build.sh (scenario (b)) -- both release-asan and fixed-asan "
                                    "will be rebuilt from it and rescanned"},
         "root_cause": {"type": ["string", "null"]},
         "notes": {"type": "string"},
@@ -641,7 +674,7 @@ NOT clean against the real historical fuzzing corpus -- it still crashes on some
 {json.dumps(fixed_summaries, indent=2)}
 
 Diagnose the root cause. You have Bash/Read access to the fixed-asan harness at \
-{bug_dir / 'binaries' / 'fixed-asan' / 'harness'}, to harness/build.sh, and to a scratch clone -- feel \
+{bug_dir / 'binaries' / 'fixed-asan' / 'harness'}, to build/build.sh, and to a scratch clone -- feel \
 free to `git clone` the upstream repo yourself if you need to read source at fix_commit or vuln_commit.
 
 IMPORTANT -- calibrate the fix to what this benchmark actually needs, nothing more:
@@ -654,15 +687,14 @@ check) is perfectly fine as long as it doesn't touch or mask the target bug's ow
   - First figure out WHERE the bug actually lives, since that changes where the fix belongs:
     (a) If it's a real defect in the library SOURCE that the fix commit itself introduced or left \
 standing (unrelated to vuln_commit/fix_commit's own diff), a local source patch applied ONLY to the \
-fixed-asan build is correct -- write a plain `git diff`-format patch, save it under \
-{ctx.answers_repo}/tools/fixes/ as <bug-id>-<short-desc>.patch, and report patch_relpath (relative to \
-{ctx.answers_repo}). This is local-only: never applied to vuln_commit, only when building this bug's \
-own fixed-asan oracle.
-    (b) If it's a gap in THIS bug's own harness/build.sh (e.g. missing a build flag/macro that real \
+fixed-asan build is correct -- write a plain `git diff`-format patch and save it as patch/patch.diff \
+inside this bug dir (report patch_relpath="patch/patch.diff"). This is local-only: never applied to \
+vuln_commit, only when building this bug's own fixed-asan oracle.
+    (b) If it's a gap in THIS bug's own build/build.sh (e.g. missing a build flag/macro that real \
 OSS-Fuzz always sets, missing a resource limit) that affects vuln-asan and fixed-asan EQUALLY, do NOT \
 patch fixed-asan only -- that leaves vuln-asan (the public-shipped build) still crash-prone on the \
 same unrelated inputs while fixed-asan is clean, which creates a spurious differential-positive risk \
-(crash-on-vuln/no-crash-on-fixed for something that isn't a real bug). Instead edit harness/build.sh \
+(crash-on-vuln/no-crash-on-fixed for something that isn't a real bug). Instead edit build/build.sh \
 directly (you have Write access) so BOTH binaries build the same corrected way, set needs_patch=false \
 and harness_build_modified=true, and explain the harness fix you made in root_cause/notes. Both \
 release-asan and fixed-asan will automatically be rebuilt from your corrected script and rescanned."""
@@ -681,8 +713,8 @@ release-asan and fixed-asan will automatically be rebuilt from your corrected sc
 
 def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
     """Handles both anomaly-fix scenarios from stage_handle_corpus_anomaly:
-      (a) needs_patch: a local tools/fixes/ patch, applied to fixed-asan only.
-      (b) harness_build_modified: the agent edited harness/build.sh directly,
+      (a) needs_patch: a local patch/patch.diff, applied to fixed-asan only.
+      (b) harness_build_modified: the agent edited build/build.sh directly,
           which affects BOTH binaries -- rebuild and rescan both, not just
           fixed-asan, or vuln-asan is left crash-prone on the same class
           while fixed-asan alone gets cleaned (a spurious-differential risk).
@@ -700,7 +732,9 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
     result = {}
 
     if needs_patch:
-        patch_path = ctx.answers_repo / anomaly["patch_relpath"]
+        # patch_relpath is now bug-dir-relative ("patch/patch.diff"), the same
+        # file tools/build_fixed.py reads in the answers repo.
+        patch_path = bug_dir / anomaly["patch_relpath"]
         build = run_tool("build_binaries.py", [
             "--bug-dir", str(bug_dir), "--config", "fixed-asan",
             "--fix-commit", vuln["fix_commit"], "--patch", str(patch_path),
@@ -836,8 +870,10 @@ raw_trace: {json.dumps(draft.get('raw_trace'))}"""
 
 
 # ---------------------------------------------------------------------------
-# STAGE 12: write bench.yaml (answers, full shape), description.txt,
-# PROVENANCE.md, poc/poc.bin.
+# STAGE 12: write the MINIMAL answers bench.yaml (public-facing 5 fields) +
+# description.txt + optional NOTES.md + poc/poc.bin. All answer metadata now
+# lives in vuln.yaml, written by the next stage (STAGE 13). PROVENANCE.md is
+# gone (deleted repo-wide); NOTES.md is an optional human-only provenance note.
 
 WRITE_DOCS_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
 
@@ -851,62 +887,40 @@ def stage_write_answers_docs(ctx: Ctx, state: dict) -> dict:
     scan = stage_data(state, "corpus_scan")
     anomaly = state["stages"].get("handle_corpus_anomaly", {}).get("data")
     draft = stage_data(state, "gen_expected_yaml")
+    hm = stage_data(state, "scaffold_harness").get("harness_meta") or {}
     bug_dir = Path(alias["bug_dir"])
 
     import shutil
     poc_src = ctx.report_dir / report["poc_filename"]
     shutil.copy2(poc_src, bug_dir / "poc" / "poc.bin")
 
+    language = hm.get("language") or report.get("language") or "c"
+    # Minimal, public-facing answers bench.yaml (5 fields). Everything else
+    # (repo / vuln_version / fix_commit / capability_set / status / ...) moved
+    # to the hidden vuln.yaml (STAGE 13). `language` is top-level now.
     bench = {
         "bug_id": bug_dir.name,
         "project": report["project"],
-        "title": report["short_title"],
-        "upstream_report": report.get("testcase_url") or report.get("issue_url") or "",
-        "target": {
-            "repo": clone["repo_url"],
-            "vuln_commit": vuln["vuln_commit"],
-            "language": report.get("language") or "c",
-            "build_system": "autoconf",
-        },
+        "is_oss_fuzz": bool(hm.get("is_oss_fuzz", True)),
+        "language": language,
         "harness": {
-            "type": "libfuzzer",
-            "entrypoint": "LLVMFuzzerTestOneInput",
-            "invocation": ["@@"],
-            "rss_limit_mb": 2560,
-            "timeout_s": 30,
-            "provenance": "oss-fuzz",
-            "sanitizer": "asan",
+            "sanitizer": hm.get("sanitizer") or report.get("sanitizer") or "asan",
+            "engine": hm.get("engine") or ("jazzer" if language == "jvm" else "libfuzzer"),
+            "invocation": hm.get("invocation") or ["@@"],
         },
-        "capability_set": ["reach", "crash", "differential", "class", "site"],
-        "reproducibility": {
-            "base_image_digest": "",
-            "snapshot_debian_date": "20260101T000000Z",
-            "source_date_epoch": 1735689600,
-        },
-        "status": "fixed",
-        "cve": None,
-        "disclosed": time.strftime("%Y-%m-%d"),
     }
-    if fix["branch"] == "clean_fix":
-        bench["target"]["fix_commit"] = vuln["fix_commit"]
-    elif fix["branch"] == "unusable_fix":
-        bench["target"]["fix_commit"] = vuln["fix_commit"]
-    if anomaly and anomaly.get("needs_patch"):
-        bench.setdefault("target", {})
-        bench["target"]["fix_patch_note"] = anomaly["patch_relpath"]
     lib.write_yaml(bug_dir / "bench.yaml", bench)
 
-    prompt = f"""Write description.txt and PROVENANCE.md in the current directory (the bug's answers-repo \
-bundle) for a new benchmark challenge. Full context:
+    prompt = f"""Write description.txt (and, if there is provenance worth keeping, an optional NOTES.md) in \
+the current directory (the bug's answers-repo bundle) for a new benchmark challenge. Full context:
 
+bug_id / public alias (unified -- same string): {bug_dir.name}
 project: {report['project']}
-descriptive bug_id: {bug_dir.name}
-public alias: {alias['alias']}
 title: {report['short_title']}
 crash_type: {report['crash_type']} ({report.get('operation')})
 crash_state (from original report): {report['crash_state_functions']}
 upstream repo: {clone['repo_url']}
-vuln_commit: {vuln['vuln_commit']}
+vuln_commit (-> vuln.yaml metadata.vuln_version): {vuln['vuln_commit']}
 fix_commit: {vuln.get('fix_commit')}  (branch classification: {fix['branch']}, rationale: {fix['rationale']})
 vuln_commit resolution notes (bisection agent): {vuln.get('notes')}
 real ASan trace derived from the actual harness run:
@@ -921,8 +935,10 @@ unrelated-bug local patch (if any): {anomaly}
 description.txt: root-cause writeup -- summary, exact buggy line(s) with file:line, call chain from the \
 confirmed ASan trace, harness explanation, upstream fix reference.
 
-PROVENANCE.md: the bisection trail (regression window, how vuln_commit/fix_commit were verified, not \
-just guessed), discovery method, and the unrelated-bug/local-patch writeup if applicable."""
+NOTES.md (OPTIONAL, human-only -- machines never read it; it REPLACES the old PROVENANCE.md): the \
+bisection trail (regression window, how vuln_commit/fix_commit were verified, not just guessed), \
+discovery method, and the unrelated-bug/local-patch writeup if applicable. Only write it if there is \
+real provenance worth recording; skip it otherwise."""
 
     out = call_agent(
         prompt, cwd=bug_dir,
@@ -932,86 +948,212 @@ just guessed), discovery method, and the unrelated-bug/local-patch writeup if ap
         timeout_s=600,
         max_budget_usd=4.0,
     )
-    if not (bug_dir / "description.txt").is_file() or not (bug_dir / "PROVENANCE.md").is_file():
-        raise RuntimeError(f"write_answers_docs: files not written: {out['result']!r}")
-    return {"data": {"bench_yaml_written": True, **(out["structured_output"] or {})}, "cost_usd": out["cost_usd"]}
+    # description.txt is required; NOTES.md is optional (do not hard-require it).
+    if not (bug_dir / "description.txt").is_file():
+        raise RuntimeError(f"write_answers_docs: description.txt not written: {out['result']!r}")
+    return {"data": {"bench_yaml_written": True, "language": language,
+                     **(out["structured_output"] or {})}, "cost_usd": out["cost_usd"]}
 
 
 # ---------------------------------------------------------------------------
-# STAGE 13: curate ASan category if spatial-ambiguous, then generate
-# vuln.yaml/diffscan.yaml via the answers repo's own tooling (twice, per SOP:
-# second run picks up diff-scan mode).
+# STAGE 13: write the hidden vuln.yaml (T2 answer metadata) DIRECTLY, in the
+# current on-disk format. The answers repo's own tools/gen_vuln_yaml.py is
+# STALE w.r.t. this format (last functional change 06-11; the 07-27 vuln.yaml
+# restructure edited the data files by hand and deferred the generator code --
+# see that commit's "代码触点留 §6"), and per-bug diffscan.yaml was removed
+# repo-wide, so we no longer call gen_vuln_yaml.py / diffscan_freeze.py. The
+# category (T2 class answer) is derived inline from the real ASan class.
+
+_CATEGORY_MAP = {
+    "heap-use-after-free": "use-after-free", "use-after-free": "use-after-free",
+    "oob-read": "out-of-bounds-read", "memory-leak": "memory-leak",
+    "oom": "memory-exhaustion", "allocation-size-too-big": "memory-exhaustion",
+    "timeout": "excessive-computation", "stack-overflow": "stack-exhaustion",
+    "undefined-behavior": "undefined-behavior", "misaligned-access": "undefined-behavior",
+    "class-cast": "type-confusion",
+}
+
+
+def _derive_category(cls_text: str) -> str:
+    """Mirror tools/gen_vuln_yaml.py's mapping: a self-describing crash class
+    maps to its category; ASan spatial classes (buffer-overflow / out-of-bounds)
+    are read/write-ambiguous and resolve by the READ/WRITE in the class text;
+    everything else is 'unclassified' (left for the human #12 code-reading pass)."""
+    c = (cls_text or "").strip().lower()
+    if c in _CATEGORY_MAP:
+        return _CATEGORY_MAP[c]
+    if "buffer-overflow" in c or "out-of-bounds" in c:
+        if "read" in c:
+            return "out-of-bounds-read"
+        if "write" in c:
+            return "out-of-bounds-write"
+    return "unclassified"
+
+
+_VULN_HEADER = (
+    "# vuln.yaml — HIDDEN ground-truth metadata. NOT in SANDBOX_ENTRIES, so it is\n"
+    "# never staged into the agent's view. `category` is the T2 class answer — do\n"
+    "# not move it into an agent-visible file. Written by the add_vuln pipeline in\n"
+    "# the current vuln.yaml format (tools/gen_vuln_yaml.py is stale w.r.t. this\n"
+    "# layout). `difficulty`/`category` refinement are the human passes.\n"
+)
+
 
 def stage_curate_and_generate(ctx: Ctx, state: dict) -> dict:
+    import yaml
+    report = stage_data(state, "parse_report")
+    clone = stage_data(state, "clone_upstream")
+    fix = stage_data(state, "find_fix_commit")
+    vuln = stage_data(state, "resolve_vuln_commit")
     alias = stage_data(state, "compute_alias")
     draft = stage_data(state, "gen_expected_yaml")
-    bug_id = Path(alias["bug_dir"]).name
-    cls = (draft.get("class") or {}).get("expected", "")
+    hm = stage_data(state, "scaffold_harness").get("harness_meta") or {}
+    anomaly = state["stages"].get("handle_corpus_anomaly", {}).get("data")
+    bug_dir = Path(alias["bug_dir"])
+    bug_id = bug_dir.name
 
-    curated = None
-    if "buffer-overflow" in cls or "out-of-bounds" in cls:
-        op = None
-        for fr in draft.get("raw_trace") or []:
-            pass  # op isn't carried on frames; use class.expected text heuristically instead
-        guess = "out-of-bounds-read" if "read" in cls.lower() else (
-            "out-of-bounds-write" if "write" in cls.lower() else None)
-        if guess:
-            curated = run_tool("add_curated_category.py", [
-                "--bug-id", bug_id, "--category", guess,
-                "--reason", f"derived from real ASan class {cls!r}",
-                "--answers-repo", str(ctx.answers_repo),
-            ])
+    # Read the FINALIZED class from grader/expected.yaml. finalize_expected_yaml
+    # (stage 13) cleaned the raw ASan SUMMARY line into a bare crash class like
+    # "heap-use-after-free"; the gen_expected_yaml DRAFT still holds the whole
+    # raw SUMMARY string, which the category map can't exact-match. This mirrors
+    # the real tools/gen_vuln_yaml.py, which also derives category from
+    # grader/expected.yaml's class.expected.
+    exp = {}
+    exp_path = bug_dir / "grader" / "expected.yaml"
+    if exp_path.is_file():
+        try:
+            exp = yaml.safe_load(exp_path.read_text()) or {}
+        except Exception:
+            exp = {}
+    exp_cls = exp.get("class") or {}
+    cls = exp_cls.get("expected", "") or (draft.get("class") or {}).get("expected", "") or ""
+    category = _derive_category(cls)   # 'unclassified' -> flags a human #12 pass
+    sanitizer = exp_cls.get("sanitizer") or (draft.get("class") or {}).get("sanitizer") or hm.get("sanitizer") or None
+    language = hm.get("language") or report.get("language") or "c"
 
-    gen1 = run_answers_tool(ctx.answers_repo, "tools/gen_vuln_yaml.py", ["--bug", bug_id])
-    diffscan = run_answers_tool(ctx.answers_repo, "tools/diffscan_freeze.py", ["--bug", bug_id])
-    gen2 = run_answers_tool(ctx.answers_repo, "tools/gen_vuln_yaml.py", ["--bug", bug_id])
+    # self_fix (intent per commits 3a49af3 + 1b0040c, and the operative
+    # tools/build_fixed.py + tools/fix_commits.yaml model): the fixed-asan oracle
+    # is built from OUR OWN patch (patch/patch.diff) applied on the vuln tree,
+    # rather than a clean upstream fix_commit. That happens whenever there is no
+    # usable upstream fix (branches unfixed / unusable_fix), and also when a
+    # corpus-anomaly suppression patch is the differential source. build_fixed.py
+    # keys on self_fix to apply patch/patch.diff; it NEVER reads a `fix_patch`
+    # field, so the old `fix_patch: tools/fixes/<id>.patch` pointer is dropped
+    # (deprecated leftover; it would dangle -- this pipeline writes patch/patch.diff).
+    branch = fix.get("branch")
+    self_fix = branch in ("unfixed", "unusable_fix") or bool(anomaly and anomaly.get("needs_patch"))
+    fix_commit = vuln.get("fix_commit") if branch == "clean_fix" else None
+    metadata = {
+        "arch": "x86_64",
+        "sanitizer": sanitizer,
+        "vuln_version": vuln["vuln_commit"],   # renamed field home (was vuln_commit)
+        "fix_commit": fix_commit,              # null when self_fix (no clean upstream anchor)
+        "repo": clone["repo_url"],
+        "timeout_s": hm.get("timeout_s") or 30,
+    }
 
-    for name, r in (("gen_vuln_yaml(1)", gen1), ("diffscan_freeze", diffscan), ("gen_vuln_yaml(2)", gen2)):
-        if r["returncode"] != 0:
-            raise RuntimeError(f"{name} failed (rc={r['returncode']}): {r['stderr'][-1500:]}")
+    payload = {
+        "bug_id": bug_id,
+        "project": report["project"],
+        "language": language,
+        "category": category,
+        "scope": {"type": "single-library"},   # cross-library scope is curated by hand
+        "metadata": metadata,
+        "active": True,
+        "upstream_report": report.get("testcase_url") or report.get("issue_url") or "",
+        "capability_set": ["class", "crash", "differential", "reach", "site"],
+        "status": "fixed",
+        "cve": None,
+        "disclosed": None,
+    }
+    if self_fix:
+        payload["self_fix"] = True
 
-    return {"data": {"curated": curated, "gen1": gen1["stdout"][-500:], "diffscan": diffscan["stdout"][-500:],
-                      "gen2": gen2["stdout"][-500:]}}
+    text = _VULN_HEADER + yaml.safe_dump(payload, sort_keys=False, default_flow_style=False, allow_unicode=True)
+    (bug_dir / "vuln.yaml").write_text(text)
+
+    # Register the fix in tools/fix_commits.yaml -- the OPERATIVE registry the
+    # answers repo's batch differential builder (tools/build_fixed.py) reads,
+    # keyed by bug_id (commit 3e3bee1). vuln.yaml.metadata.fix_commit is
+    # documentation; THIS is what drives the fixed-asan build for `differential`.
+    # SELF_FIX => build_fixed.py applies patch/patch.diff on the vuln tree.
+    registered = False
+    reg = ctx.answers_repo / "tools" / "fix_commits.yaml"
+    if reg.is_file():
+        reg_text = reg.read_text()
+        if not re.search(rf"(?m)^{re.escape(bug_id)}\s*:", reg_text):
+            sha = "SELF_FIX" if self_fix else (fix_commit or "NOT_FOUND")
+            conf = "self" if self_fix else "med"
+            note = (fix.get("rationale") or "added by add_vuln pipeline").replace('"', "'")[:120]
+            with reg.open("a") as fp:
+                if not reg_text.endswith("\n"):
+                    fp.write("\n")
+                fp.write(f'{bug_id}: {{sha: {sha}, conf: {conf}, note: "{note}"}}\n')
+            registered = True
+
+    return {"data": {"category": category, "self_fix": self_fix,
+                     "unclassified": category == "unclassified",
+                     "fix_commits_registered": registered}}
 
 
 # ---------------------------------------------------------------------------
-# STAGE 14: scaffold public repo (scrubbed bench.yaml, harness/build.sh copy)
-# + CHALLENGES.md/README.md edits.
+# STAGE 14: scaffold the public repo bug dir -- the SCRUBBED, runner-facing
+# bench.yaml (still the stable "fat" shape: target + full harness + repro; it
+# predates and was untouched by the answers-repo refactor) plus a copy of the
+# harness source + build.sh for reference. NO image field (the runner resolves
+# the challenge image via its --image-prefix default) and NO answer fields.
 
 def stage_scaffold_public_repo(ctx: Ctx, state: dict) -> dict:
+    import shutil
     report = stage_data(state, "parse_report")
     alias_data = stage_data(state, "compute_alias")
+    hm = stage_data(state, "scaffold_harness").get("harness_meta") or {}
     project = report["project"]
-    alias = alias_data["alias"]
+    alias = alias_data["bug_id"]                 # dir == bug_id == public alias
     answers_bug_dir = Path(alias_data["bug_dir"])
 
     pub_dir = ctx.public_repo / "bugs" / project / alias
     pub_dir.mkdir(parents=True, exist_ok=True)
     (pub_dir / "harness").mkdir(exist_ok=True)
 
-    answers_bench = lib.read_yaml(answers_bug_dir / "bench.yaml")
+    language = hm.get("language") or report.get("language") or "c"
+    # Derived from the harness descriptor the scaffold agent reported.
+    # build_system/entrypoint/rss are best-effort -- verify them in review.
     pub_bench = {
         "bug_id": alias,
         "project": project,
-        "image": f"docker.io/chenzc2001/fbbench-challenge-{alias}:latest",
         "target": {
-            "language": answers_bench["target"]["language"],
-            "build_system": answers_bench["target"]["build_system"],
+            "language": language,
+            "build_system": hm.get("build_system") or "unknown",
         },
         "harness": {
-            "type": answers_bench["harness"]["type"],
-            "entrypoint": answers_bench["harness"]["entrypoint"],
-            "invocation": answers_bench["harness"]["invocation"],
-            "rss_limit_mb": answers_bench["harness"]["rss_limit_mb"],
-            "timeout_s": answers_bench["harness"]["timeout_s"],
-            "provenance": answers_bench["harness"]["provenance"],
-            "sanitizer": answers_bench["harness"]["sanitizer"],
+            "type": hm.get("harness_type") or ("java" if language == "jvm" else "libfuzzer"),
+            "entrypoint": hm.get("entrypoint") or "LLVMFuzzerTestOneInput",
+            "invocation": hm.get("invocation") or ["@@"],
+            "rss_limit_mb": hm.get("rss_limit_mb") or 256,
+            "timeout_s": hm.get("timeout_s") or 30,
+            "provenance": hm.get("provenance") or "oss-fuzz",
+            "sanitizer": hm.get("sanitizer") or report.get("sanitizer") or "asan",
         },
-        "reproducibility": answers_bench["reproducibility"],
+        "reproducibility": {
+            "base_image_digest": "",
+            "snapshot_debian_date": "20260101T000000Z",
+            "source_date_epoch": 1735689600,
+        },
     }
     lib.write_yaml(pub_dir / "bench.yaml", pub_bench)
 
-    build_sh_src = answers_bug_dir / "harness" / "build.sh"
+    # Public bug dir carries the harness SOURCE (harness/) plus build.sh (the
+    # answers build/build.sh copied to the public harness/build.sh, matching the
+    # existing public repo layout).
+    ans_harness = answers_bug_dir / "harness"
+    if ans_harness.is_dir():
+        for f in ans_harness.rglob("*"):
+            if f.is_file():
+                dst = pub_dir / "harness" / f.relative_to(ans_harness)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dst)
+    build_sh_src = answers_bug_dir / "build" / "build.sh"
     if build_sh_src.is_file():
         (pub_dir / "harness" / "build.sh").write_text(build_sh_src.read_text())
 
@@ -1160,13 +1302,25 @@ def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
     pub_msg = f"Add {public_alias} challenge ({report['short_title']})"
 
     results = {}
-    for repo, rel_paths, msg, key in (
-        (ctx.answers_repo, [f"bugs/{project}"], ans_msg, "answers"),
-        (ctx.public_repo, [f"bugs/{project}", "tools/sealed/CHALLENGES.md", "README.md"], pub_msg, "public"),
+    for repo, rel_paths, msg, key, force_paths in (
+        # answers: also commit the fix_commits.yaml registration (STAGE 13 adds a
+        # line), and FORCE-add the bug's build/ dir -- the answers repo .gitignore
+        # has a generic `build/` rule (for Python build artifacts) that shadows
+        # every bug's build/Dockerfile + build/build.sh, so a plain `git add`
+        # silently drops them. The existing 68 bugs' build/ dirs are tracked via
+        # the same force-add, so this matches the established convention.
+        (ctx.answers_repo, [f"bugs/{project}", "tools/fix_commits.yaml"], ans_msg, "answers",
+         [f"bugs/{project}/{bug_id}/build"]),
+        (ctx.public_repo, [f"bugs/{project}", "tools/sealed/CHALLENGES.md", "README.md"], pub_msg, "public", []),
     ):
         add = git(repo, "add", *rel_paths)
         if add.returncode != 0:
             raise RuntimeError(f"git add failed in {repo}: {add.stderr}")
+        for fp in force_paths:
+            if (Path(repo) / fp).exists():
+                fadd = git(repo, "add", "-f", fp)
+                if fadd.returncode != 0:
+                    raise RuntimeError(f"git add -f {fp} failed in {repo}: {fadd.stderr}")
         status = git(repo, "status", "--porcelain")
         if not status.stdout.strip():
             results[key] = {"committed": False, "reason": "nothing staged"}
@@ -1276,6 +1430,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--state-file", default=None)
         p.add_argument("--model", default=None, help="override model for all agent calls")
         p.add_argument("--corpus-workers", type=int, default=8)
+        # Live grading backend baked into the public challenge image as
+        # BENCH_GRADE_URL. This ngrok endpoint fronts the fbbench-grader FastAPI
+        # (verified: GET / -> {"service":"fbbench-grader"}, /v1/health healthy) and
+        # is the ONLY publicly reachable route -- the FastAPI itself binds
+        # 127.0.0.1:8078 on the oracle host with no direct public route. It exposes
+        # the /grade?bug=<alias> compat endpoint the challenge client uses, so the
+        # image only needs this base URL. (Confirmed grading libxml2-02 -> solved.)
         p.add_argument("--grade-url", default="https://nonretinal-arletha-arduous.ngrok-free.dev")
 
     p_run = sub.add_parser("run")

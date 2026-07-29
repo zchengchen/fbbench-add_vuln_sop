@@ -93,9 +93,11 @@ are plain deterministic code.
    commit is just `HEAD`.)
 5. `compute_alias` — computes the public neutral alias (`<project>-NN`) and
    creates the bug's directory skeleton in the answers repo.
-6. **`scaffold_harness`** — writes `Dockerfile` + `harness/build.sh`, adapting
-   an existing sibling bug's template (or a mechanically-derived draft if
-   this is the project's first bug) to this bug's specific fuzz target.
+6. **`scaffold_harness`** — writes `build/Dockerfile` + `build/build.sh` (with
+   the harness SOURCE under `harness/`), adapting an existing sibling bug's
+   template (or a mechanically-derived draft if this is the project's first
+   bug) to this bug's specific fuzz target, and reports a `harness_meta`
+   descriptor used to generate the bench.yaml / vuln.yaml.
 7. `build_release_asan` — Docker-builds the vulnerable binary and confirms
    the PoC crashes with the expected signature.
 8. `build_fixed_asan` — Docker-builds the fixed binary and confirms the PoC
@@ -104,8 +106,9 @@ are plain deterministic code.
    it file-by-file against both binaries.
 10. **`handle_corpus_anomaly`** — only does real work if the fixed binary
     still crashes on some corpus file. Diagnoses the root cause and either
-    writes a minimal local patch (applied only to the fixed build) or fixes
-    `harness/build.sh` itself (if the gap affects both builds equally). The
+    writes a minimal local patch (`patch/patch.diff`, applied only to the fixed
+    build) or fixes `build/build.sh` itself (if the gap affects both builds
+    equally). The
     fix only needs to stop unrelated crashes from being discoverable — it
     does not need to be upstream/maintainer-quality.
 11. `rebuild_fixed_asan_with_patch` — rebuilds whichever binaries the
@@ -115,13 +118,17 @@ are plain deterministic code.
     `reach`/`class`/`site` from the real, symbolized ASan trace.
 14. **`finalize_expected_yaml`** — writes `grader/expected.yaml` from that
     derived data (may fix formatting, must not invent new values).
-15. **`write_answers_docs`** — writes `bench.yaml` (templated, deterministic)
-    plus `description.txt` and `PROVENANCE.md` (prose, written by Claude from
-    the actual collected facts/trace).
-16. `curate_and_generate` — curates the ASan category when ambiguous, then
-    runs the answers repo's own `gen_vuln_yaml.py` / `diffscan_freeze.py`.
-17. `scaffold_public_repo` — writes the scrubbed public `bench.yaml` (no
-    answer fields) and copies `harness/build.sh` for reference.
+15. **`write_answers_docs`** — writes the MINIMAL answers `bench.yaml`
+    (5 public fields, templated) plus `description.txt` and an optional
+    `NOTES.md` (human-only provenance; `PROVENANCE.md` is gone).
+16. `curate_and_generate` — derives the ASan `category` (T2 answer) and writes
+    the hidden `vuln.yaml` DIRECTLY in the current on-disk format. It no longer
+    calls the answers repo's `gen_vuln_yaml.py` / `diffscan_freeze.py`: that
+    generator is stale w.r.t. the post-refactor vuln.yaml layout, and per-bug
+    `diffscan.yaml` was removed repo-wide.
+17. `scaffold_public_repo` — writes the scrubbed public `bench.yaml` (still the
+    stable "fat" runner-facing shape, no answer fields, no `image:` field) and
+    copies the harness source + `build.sh` for reference.
 18. `regrade_verify` — runs the real grading oracle end-to-end and confirms
     every capability in `capability_set` fires.
 19. **`build_challenge_image`** — builds the public Docker image. Claude is

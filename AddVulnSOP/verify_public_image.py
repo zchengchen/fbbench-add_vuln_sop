@@ -61,7 +61,12 @@ def verify(image: str, expected_function: str, src_file_count_before: int | None
 
     leak_lines, err, stderr = docker_bash(
         image,
-        "find /challenge -iname 'poc*' -o -iname 'expected.yaml' -o -iname grader -o -iname binaries",
+        # vuln.yaml is the hidden T2 category answer introduced by the new
+        # answers-repo layout — it must never appear in a public image, so it
+        # is part of the leak set alongside poc/expected.yaml/grader/binaries.
+        # (A bare `-iname build` is deliberately NOT included: upstream source
+        # trees legitimately carry build/ dirs and would false-positive.)
+        "find /challenge -iname 'poc*' -o -iname 'expected.yaml' -o -iname 'vuln.yaml' -o -iname grader -o -iname binaries",
     )
     if err:
         errors.append(f"leak-find execution error: {stderr.strip()[-500:]}")

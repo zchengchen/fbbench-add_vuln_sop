@@ -20,10 +20,14 @@ clone ready, and confirm fix_commit exists (with its date, as a sanity
 anchor the agent can compare candidate vuln_commit dates against).
 
   - fix_commit given -> {branch: "clean_fix", fix_commit, fix_commit_date,
-    vuln_commit: null (caller must resolve this), clone_dir, repo_url}
+    vuln_version: null (caller must resolve this), clone_dir, repo_url}
   - no fix_commit given -> presumed unfixed upstream -> {branch: "unfixed",
-    vuln_commit: <HEAD>, fix_commit: null, ...} (HEAD is unambiguous, no
+    vuln_version: <HEAD>, fix_commit: null, ...} (HEAD is unambiguous, no
     time-inference needed for this branch)
+
+Emitted key note: the resolved vulnerable commit is reported as `vuln_version`
+(its home is vuln.yaml `metadata.vuln_version`; the old `vuln_commit` name is
+gone). It is answer metadata -> vuln.yaml, never the public bench.yaml.
 
 Usage:
     python3 resolve_vuln_fix_commits.py --project libxml2 \
@@ -88,7 +92,7 @@ def resolve(repo_url: str, fix_commit: str | None, clone_dir: Path) -> dict:
             raise RuntimeError(f"fix_commit {fix_commit!r} does not exist in {repo_url} (checked at {clone_dir}): {err.strip()}")
         return {
             "branch": "clean_fix",
-            "vuln_commit": None,  # caller (agent, time-based) must resolve this
+            "vuln_version": None,  # caller (agent, time-based) must resolve this
             "fix_commit": fix_commit,
             "fix_commit_date": commit_date(clone_dir, fix_commit),
             "clone_dir": str(clone_dir),
@@ -105,10 +109,10 @@ def resolve(repo_url: str, fix_commit: str | None, clone_dir: Path) -> dict:
     head_sha = out.strip()
     return {
         "branch": "unfixed",
-        "vuln_commit": head_sha,
+        "vuln_version": head_sha,
         "fix_commit": None,
         "fix_commit_date": None,
-        "vuln_commit_date": commit_date(clone_dir, head_sha),
+        "vuln_version_date": commit_date(clone_dir, head_sha),
         "clone_dir": str(clone_dir),
         "clone_info": clone_info,
     }
