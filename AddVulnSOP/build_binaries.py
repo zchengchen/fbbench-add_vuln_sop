@@ -22,6 +22,23 @@ import onboarding_lib as lib
 
 VALID_CONFIGS = ("release-asan", "coverage", "fixed-asan")
 
+# Local destination subpath under a bug's `binaries/` dir for each --config,
+# matching the answers repo's grading-oracle convention (tools/mcp-server/grade.go,
+# commit f0fb0b7 "move oracle bundle to binaries/vuln/{asan,cov} and fixed/{asan}").
+DEST_SUBPATH = {
+    "release-asan": Path("vuln") / "asan",
+    "coverage": Path("vuln") / "cov",
+    "fixed-asan": Path("fixed") / "asan",
+}
+
+# Where the harness binary lands INSIDE the built image at /out/, matching
+# derive_dockerfile.py's template and the current answers-repo convention.
+OUT_PATH = {
+    "release-asan": "vuln/asan",
+    "coverage": "vuln/cov",
+    "fixed-asan": "vuln/asan",  # fixed-asan is a release-asan-equivalent build, just at fix_commit
+}
+
 
 def _find_clone_block(dockerfile_text: str) -> tuple[int, int, str]:
     """Locate the `RUN git clone ... && git ... checkout ...` block in a
@@ -124,8 +141,8 @@ def build_config(bug_dir: Path, config: str, vuln_commit: str | None, fix_commit
         if not build_result["ok"]:
             return result
 
-        dest = bug_dir / "binaries" / config / "harness"
-        extract_result = lib.docker_extract(tag, f"/out/{out_config}/harness", dest)
+        dest = bug_dir / "binaries" / DEST_SUBPATH[config] / "harness"
+        extract_result = lib.docker_extract(tag, f"/out/{OUT_PATH[out_config]}/harness", dest)
         if not extract_result["ok"]:
             result["log_tail"] += "\n--- docker cp stderr ---\n" + extract_result.get("stderr", "")
             return result

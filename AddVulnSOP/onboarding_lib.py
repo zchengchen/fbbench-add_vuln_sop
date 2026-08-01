@@ -12,6 +12,8 @@ for JS to parse.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -28,6 +30,26 @@ import yaml
 def emit(obj: dict) -> None:
     """Print one compact JSON object as the last line of stdout."""
     print(json.dumps(obj))
+
+
+# ---------------------------------------------------------------------------
+# cross-process locking -- for any read-modify-write on state shared across
+# concurrently-running onboarding pipelines (a bug-id registry, a numbering
+# scheme, anything else keyed on "what already exists"). Blocks until
+# acquired; the lock file itself is never cleaned up (that's fine -- it's a
+# zero-byte marker, not the data).
+
+@contextlib.contextmanager
+def file_lock(lock_path: Path):
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +220,22 @@ def docker_extract(image_tag: str, src_path: str, dest_path: Path) -> dict:
 Paths = namedtuple("Paths", "answers public oss_fuzz")
 
 SOP_DIR = Path(__file__).resolve().parent
-BENCHMARK_ROOT = SOP_DIR.parent
+
+
+def _find_benchmark_root(start: Path) -> Path:
+    """Walk upward from `start` for the directory that has both bench repos
+    as siblings. Handles both a flat checkout (this SOP repo cloned directly
+    as e.g. `AddVulnSOP/`, a sibling of the bench repos) and this repo
+    nested one level deeper under its own repo root (e.g. cloned as
+    `fbbench-add_vuln_sop/`, with `AddVulnSOP/` as a subdirectory of that) --
+    the sibling-repo names are the one constant across both layouts."""
+    for candidate in (start, *start.parents):
+        if (candidate / "FuzzingBrain-Bench").is_dir() and (candidate / "FuzzingBrain-Bench-answers").is_dir():
+            return candidate
+    return start.parent  # neither convention matched -- fall back to the old assumption
+
+
+BENCHMARK_ROOT = _find_benchmark_root(SOP_DIR)
 
 
 def find_repo_paths(answers_repo: str | None = None, public_repo: str | None = None,

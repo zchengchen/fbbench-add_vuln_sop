@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 *.swp
+AddVulnSOP/webapp/submissions/
+AddVulnSOP/upstream_registry.lock
+# Operator-local bug-id ledger -- deliberately never committed/pushed by the
+# pipeline itself; each operator maintains their own copy.
+AddVulnSOP/upstream_registry.yaml

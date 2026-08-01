@@ -41,6 +41,24 @@ sys.path.insert(0, str(SOP_DIR))
 import onboarding_lib as lib  # noqa: E402
 import agent as agentlib  # noqa: E402
 from agent import call_agent as _call_agent_raw, AgentError  # noqa: E402
+from ensure_mcp_server import ensure_mcp_server  # noqa: E402
+
+# On-disk layout for built harness binaries under a bug's `binaries/` dir.
+# Matches the answers repo's grading-oracle convention (tools/mcp-server/grade.go,
+# commit f0fb0b7 "move oracle bundle to binaries/vuln/{asan,cov} and fixed/{asan}") --
+# grade.go reads these exact paths directly (never through this pipeline), so
+# build_binaries.py's extraction destination must match them exactly.
+BIN_VULN_ASAN = Path("binaries/vuln/asan/harness")
+BIN_VULN_COV = Path("binaries/vuln/cov/harness")
+BIN_FIXED_ASAN = Path("binaries/fixed/asan/harness")
+
+# The Go grading oracle (tools/mcp-server/setup.go's benchYAML struct) reads
+# `capability_set` from the ANSWERS bench.yaml, not vuln.yaml -- if it's absent
+# there, grade.go silently falls back to ["reach","crash","class","site"],
+# which excludes "differential" from both scoring and SOLVED, even when the
+# underlying round data shows it fired. Real bugs (e.g. skia-01) carry this
+# same list in bench.yaml AND vuln.yaml; keep both in lockstep from one constant.
+CAPABILITY_SET = ["class", "crash", "differential", "reach", "site"]
 
 # ---------------------------------------------------------------------------
 # Authorization context, prepended to every agent call via --append-system-
@@ -107,12 +125,15 @@ def _answers_python(answers_repo: Path) -> tuple[str, dict]:
     return sys.executable, env
 
 
-def run_answers_tool(answers_repo: Path, relpath: str, args: list[str], timeout_s: int = 1200) -> dict:
+def run_answers_tool(answers_repo: Path, relpath: str, args: list[str], timeout_s: int = 1200,
+                      extra_env: dict | None = None) -> dict:
     """Run a tool inside the answers repo (needs its own venv/fbbench package)."""
     import os
-    python_exe, extra_env = _answers_python(answers_repo)
+    python_exe, venv_env = _answers_python(answers_repo)
     env = dict(os.environ)
-    env.update(extra_env)
+    env.update(venv_env)
+    if extra_env:
+        env.update(extra_env)
     cmd = [python_exe, str(answers_repo / relpath)] + [str(a) for a in args]
     p = subprocess.run(cmd, cwd=str(answers_repo), env=env, capture_output=True, text=True, timeout=timeout_s)
     return {"returncode": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
@@ -120,6 +141,19 @@ def run_answers_tool(answers_repo: Path, relpath: str, args: list[str], timeout_
 
 def git(cwd: Path, *args: str, timeout_s: int = 120) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s)
+
+
+def default_branch(repo: Path) -> str:
+    """Best-effort detection of the repo's primary branch (main/master), so
+    a new bug's newbug/<bug_id> branch is always cut from ITS latest HEAD,
+    not from whatever remote-tracking guess we can't otherwise resolve."""
+    symref = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if symref.returncode == 0 and symref.stdout.strip():
+        return symref.stdout.strip().rsplit("/", 1)[-1]
+    for candidate in ("main", "master"):
+        if git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{candidate}").returncode == 0:
+            return candidate
+    return git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +196,7 @@ class Ctx:
         self.state_file = Path(args.state_file).resolve() if args.state_file else self.report_dir / ".pipeline_state.json"
         self.corpus_workers = args.corpus_workers
         self.grade_url = args.grade_url
+        self.bug_id = getattr(args, "bug_id", None)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +220,13 @@ PARSE_REPORT_SCHEMA = {
         },
         "regression_window_start": {"type": ["string", "null"]},
         "regression_window_end": {"type": ["string", "null"]},
+        "upstream_url": {
+            "type": ["string", "null"],
+            "description": "the report/issue tracker URL from report.txt's own 'upstream: <url>' header "
+                            "line, verbatim -- this is the canonical source for vuln.yaml's "
+                            "upstream_report field. Only fall back to testcase_url/issue_url below if no "
+                            "'upstream:' header line is present.",
+        },
         "testcase_url": {"type": ["string", "null"]},
         "issue_url": {"type": ["string", "null"]},
         "report_filed_at": {
@@ -242,9 +284,19 @@ def stage_parse_report(ctx: Ctx, state: dict) -> dict:
 def stage_clone_upstream(ctx: Ctx, state: dict) -> dict:
     report = stage_data(state, "parse_report")
     project = report["project"]
+    # Per-run clone dir, keyed on report_dir's own name -- NOT bug_id, which
+    # isn't assigned until STAGE 4 (compute_alias), after this stage. Without
+    # this, resolve_vuln_fix_commits.py's default (/tmp/fbbench-src-<project>,
+    # shared by PROJECT NAME ALONE) would be shared by every concurrent
+    # onboarding run for the same project: a race on `git fetch`, and a risk
+    # that find_fix_commit's agent (has raw Bash access to this clone) checks
+    # out something and yanks the HEAD out from under a sibling run reading
+    # the same directory.
+    clone_dir = Path("/tmp") / f"fbbench-src-{project}-{ctx.report_dir.name}"
     out = run_tool("resolve_vuln_fix_commits.py", [
         "--project", project,
         "--oss-fuzz-repo", str(ctx.oss_fuzz_repo),
+        "--clone-dir", str(clone_dir),
     ], timeout_s=1800)
     if "error" in out:
         raise RuntimeError(f"clone_upstream failed: {out['error']}")
@@ -432,11 +484,17 @@ Do not stop at a plausible-looking commit without actually running the tool agai
 def stage_compute_alias(ctx: Ctx, state: dict) -> dict:
     report = stage_data(state, "parse_report")
     project = report["project"]
-    # Unified identity: dir name == bug_id == public alias == <project>-NN.
-    # compute_alias.py returns the next sequential id; there is no separate
-    # descriptive id to feed in.
+    if not ctx.bug_id:
+        raise RuntimeError("compute_alias: --bug-id is required (there is no auto-assignment "
+                            "anymore -- pass the exact <project>-NN you want)")
+    # Unified identity: dir name == bug_id == public alias == <project>-NN,
+    # supplied by the operator and used verbatim. Nothing is scanned, nothing
+    # is checked for collision: an existing bundle at this id gets overwritten
+    # by the stages that follow. compute_alias.py only notes url -> bug_id in
+    # the write-only ledger.
+    upstream_url = report.get("upstream_url") or report.get("testcase_url") or report.get("issue_url") or ""
     out = run_tool("compute_alias.py", [
-        "--project", project, "--answers-repo", str(ctx.answers_repo),
+        "--bug-id", ctx.bug_id, "--upstream-url", upstream_url, "--project", project,
     ])
     bug_id = out["bug_id"]
     bug_dir = ctx.answers_repo / "bugs" / project / bug_id
@@ -577,7 +635,7 @@ def stage_build_release_asan(ctx: Ctx, state: dict) -> dict:
     if not build.get("built"):
         raise RuntimeError(f"build_release_asan failed: {build.get('log_tail', '')[-2000:]}")
 
-    harness = bug_dir / "binaries" / "release-asan" / "harness"
+    harness = bug_dir / BIN_VULN_ASAN
     poc_path = (ctx.report_dir / report["poc_filename"]).resolve()
     result = lib.run_harness_once(harness, ["@@"], poc_path, timeout_s=30)
     if not result["fault"]:
@@ -605,7 +663,7 @@ def stage_build_fixed_asan(ctx: Ctx, state: dict) -> dict:
     if not build.get("built"):
         raise RuntimeError(f"build_fixed_asan failed: {build.get('log_tail', '')[-2000:]}")
 
-    harness = bug_dir / "binaries" / "fixed-asan" / "harness"
+    harness = bug_dir / BIN_FIXED_ASAN
     poc_path = (ctx.report_dir / report["poc_filename"]).resolve()
     result = lib.run_harness_once(harness, ["@@"], poc_path, timeout_s=30)
     if result["fault"]:
@@ -629,13 +687,13 @@ def stage_corpus_scan(ctx: Ctx, state: dict) -> dict:
 
     vuln_scan = run_tool("corpus_scan.py", [
         "--project", project, "--target", target,
-        "--harness", str(bug_dir / "binaries" / "release-asan" / "harness"),
+        "--harness", str(bug_dir / BIN_VULN_ASAN),
         "--download-corpus", "--workers", str(ctx.corpus_workers),
     ], timeout_s=3600)
 
     fixed_scan = run_tool("corpus_scan.py", [
         "--project", project, "--target", target,
-        "--harness", str(bug_dir / "binaries" / "fixed-asan" / "harness"),
+        "--harness", str(bug_dir / BIN_FIXED_ASAN),
         "--download-corpus", "--workers", str(ctx.corpus_workers),
     ], timeout_s=3600)
 
@@ -674,7 +732,7 @@ NOT clean against the real historical fuzzing corpus -- it still crashes on some
 {json.dumps(fixed_summaries, indent=2)}
 
 Diagnose the root cause. You have Bash/Read access to the fixed-asan harness at \
-{bug_dir / 'binaries' / 'fixed-asan' / 'harness'}, to build/build.sh, and to a scratch clone -- feel \
+{bug_dir / BIN_FIXED_ASAN}, to build/build.sh, and to a scratch clone -- feel \
 free to `git clone` the upstream repo yourself if you need to read source at fix_commit or vuln_commit.
 
 IMPORTANT -- calibrate the fix to what this benchmark actually needs, nothing more:
@@ -743,7 +801,7 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
             raise RuntimeError(f"rebuild fixed-asan with patch failed: {build.get('log_tail', '')[-2000:]}")
         rescan = run_tool("corpus_scan.py", [
             "--project", report["project"], "--target", report["fuzz_target"],
-            "--harness", str(bug_dir / "binaries" / "fixed-asan" / "harness"),
+            "--harness", str(bug_dir / BIN_FIXED_ASAN),
             "--download-corpus", "--workers", str(ctx.corpus_workers),
         ], timeout_s=3600)
         if rescan.get("summaries"):
@@ -758,7 +816,7 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
         ], timeout_s=2400)
         if not vuln_build.get("built"):
             raise RuntimeError(f"rebuild release-asan from corrected harness failed: {vuln_build.get('log_tail', '')[-2000:]}")
-        vuln_check = lib.run_harness_once(bug_dir / "binaries" / "release-asan" / "harness", ["@@"], poc_path, timeout_s=30)
+        vuln_check = lib.run_harness_once(bug_dir / BIN_VULN_ASAN, ["@@"], poc_path, timeout_s=30)
         if not vuln_check["fault"]:
             raise RuntimeError(f"release-asan no longer reproduces the target bug after harness fix: {vuln_check}")
 
@@ -769,7 +827,7 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
             ], timeout_s=2400)
             if not fixed_build.get("built"):
                 raise RuntimeError(f"rebuild fixed-asan from corrected harness failed: {fixed_build.get('log_tail', '')[-2000:]}")
-            fixed_check = lib.run_harness_once(bug_dir / "binaries" / "fixed-asan" / "harness", ["@@"], poc_path, timeout_s=30)
+            fixed_check = lib.run_harness_once(bug_dir / BIN_FIXED_ASAN, ["@@"], poc_path, timeout_s=30)
             if fixed_check["fault"]:
                 raise RuntimeError(f"fixed-asan still crashes on the PoC after harness fix: {fixed_check}")
         else:
@@ -777,14 +835,14 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
 
         vuln_rescan = run_tool("corpus_scan.py", [
             "--project", report["project"], "--target", report["fuzz_target"],
-            "--harness", str(bug_dir / "binaries" / "release-asan" / "harness"),
+            "--harness", str(bug_dir / BIN_VULN_ASAN),
             "--download-corpus", "--workers", str(ctx.corpus_workers),
         ], timeout_s=3600)
         fixed_rescan = None
         if fix_commit:
             fixed_rescan = run_tool("corpus_scan.py", [
                 "--project", report["project"], "--target", report["fuzz_target"],
-                "--harness", str(bug_dir / "binaries" / "fixed-asan" / "harness"),
+                "--harness", str(bug_dir / BIN_FIXED_ASAN),
                 "--download-corpus", "--workers", str(ctx.corpus_workers),
             ], timeout_s=3600)
             if fixed_rescan.get("summaries"):
@@ -827,7 +885,7 @@ def stage_gen_expected_yaml(ctx: Ctx, state: dict) -> dict:
     poc_path = (ctx.report_dir / report["poc_filename"]).resolve()
 
     draft = run_tool("gen_expected_yaml.py", [
-        "--harness", str(bug_dir / "binaries" / "release-asan" / "harness"),
+        "--harness", str(bug_dir / BIN_VULN_ASAN),
         "--poc", str(poc_path),
         "--src-dir", clone["clone_dir"],
         "--bug-id", alias["alias"],
@@ -895,9 +953,13 @@ def stage_write_answers_docs(ctx: Ctx, state: dict) -> dict:
     shutil.copy2(poc_src, bug_dir / "poc" / "poc.bin")
 
     language = hm.get("language") or report.get("language") or "c"
-    # Minimal, public-facing answers bench.yaml (5 fields). Everything else
-    # (repo / vuln_version / fix_commit / capability_set / status / ...) moved
-    # to the hidden vuln.yaml (STAGE 13). `language` is top-level now.
+    # Minimal, public-facing-shaped answers bench.yaml. repo / vuln_version /
+    # fix_commit / status / ... live in the hidden vuln.yaml (STAGE 15), but
+    # `capability_set` must ALSO be here: the grading oracle's loadBench() reads
+    # it straight from this file (tools/mcp-server/setup.go), not from
+    # vuln.yaml -- omitting it here makes grade.go silently drop to a 4-flag
+    # default that excludes "differential" from scoring. Real bugs (e.g.
+    # skia-01) carry it in bench.yaml too. `language` is top-level now.
     bench = {
         "bug_id": bug_dir.name,
         "project": report["project"],
@@ -908,6 +970,7 @@ def stage_write_answers_docs(ctx: Ctx, state: dict) -> dict:
             "engine": hm.get("engine") or ("jazzer" if language == "jvm" else "libfuzzer"),
             "invocation": hm.get("invocation") or ["@@"],
         },
+        "capability_set": CAPABILITY_SET,
     }
     lib.write_yaml(bug_dir / "bench.yaml", bench)
 
@@ -1060,8 +1123,8 @@ def stage_curate_and_generate(ctx: Ctx, state: dict) -> dict:
         "scope": {"type": "single-library"},   # cross-library scope is curated by hand
         "metadata": metadata,
         "active": True,
-        "upstream_report": report.get("testcase_url") or report.get("issue_url") or "",
-        "capability_set": ["class", "crash", "differential", "reach", "site"],
+        "upstream_report": report.get("upstream_url") or report.get("testcase_url") or report.get("issue_url") or "",
+        "capability_set": CAPABILITY_SET,
         "status": "fixed",
         "cve": None,
         "disclosed": None,
@@ -1204,15 +1267,27 @@ SCRUB_DECISION_SCHEMA = {
 }
 
 
+
 def stage_build_challenge_image(ctx: Ctx, state: dict) -> dict:
     alias = stage_data(state, "compute_alias")
     report = stage_data(state, "parse_report")
     bug_id = Path(alias["bug_dir"]).name
     public_alias = stage_data(state, "scaffold_public_repo")["alias"]
 
+    # build_challenge.py bakes the PUBLIC repo's OWN mcp-server (a different,
+    # smaller client binary than the answers repo's oracle-side one -- not
+    # interchangeable) into the challenge image. Never trust a manually
+    # placed/possibly-absent bin/mcp-server there; always build/reuse one
+    # from that repo's current tools/mcp-server source, same as
+    # regrade_verify.py does for the answers repo.
+    ensured_public_mcp = ensure_mcp_server(ctx.public_repo)
+    if not ensured_public_mcp.get("ok"):
+        raise RuntimeError(f"build_challenge_image: could not build the public repo's mcp-server: "
+                            f"{ensured_public_mcp.get('error')}")
+
     staged = run_answers_tool(ctx.answers_repo, "tools/sealed/build_challenge.py", [
         bug_id, "--grade-url", ctx.grade_url, "--no-build",
-    ], timeout_s=600)
+    ], timeout_s=600, extra_env={"BENCH_PUBLIC_MCP": ensured_public_mcp["path"]})
     if staged["returncode"] != 0:
         raise RuntimeError(f"build_challenge.py --no-build failed: {staged['stderr'][-2000:]}")
     m = re.search(r"context ready at (\S+)", staged["stdout"])
@@ -1270,7 +1345,7 @@ You have Read access to inspect any file before deciding. Return the exact relat
     if not build["ok"]:
         raise RuntimeError(f"docker build of challenge image failed: {build['log_tail']}")
 
-    final_tag = f"docker.io/chenzc2001/fbbench-challenge-{public_alias}:latest"
+    final_tag = f"docker.io/osanzas/fbbench-challenge-{public_alias}:latest"
     subprocess.run(["docker", "tag", tag, final_tag], check=True)
 
     return {"data": {"ctx_dir": str(ctx_dir), "sweep": sweep, "scrub_decision": decision,
@@ -1279,17 +1354,42 @@ You have Read access to inspect any file before deciding. Return the exact relat
 
 def stage_verify_challenge_image(ctx: Ctx, state: dict) -> dict:
     built = stage_data(state, "build_challenge_image")
-    draft = stage_data(state, "gen_expected_yaml")
-    verify = run_tool("verify_public_image.py", [
-        "--image", built["tag"], "--expected-function", draft["reach"]["expected_function"] or "",
-    ], timeout_s=300)
+
+    # Coarse structural audit only: are the five components a challenge can't
+    # work without actually in the built image (src/, harness/, bench.yaml,
+    # description.txt, mcp-server)? Nothing per-field or per-file -- earlier
+    # revisions also ran an agent over bench.yaml, diffed the source file
+    # count across the scrub, and re-scanned for answer leaks; the first two
+    # were finer than this gate needs, and leak coverage already happens
+    # pre-build in build_challenge.py's own leak_audit().
+    verify = run_tool("verify_public_image.py", ["--image", built["tag"]], timeout_s=300)
     if not verify.get("ok"):
-        raise RuntimeError(f"verify_public_image failed: {verify}")
+        raise RuntimeError(f"challenge image is missing required components: {verify}")
+
     return {"data": verify}
 
 
 # ---------------------------------------------------------------------------
-# STAGE 17: commit locally in both repos. NEVER push.
+# STAGE 17: commit locally in both repos, on a per-bug branch. NEVER push.
+#
+# Each bug gets its own branch `newbug/<bug_id>` in BOTH repos, cut from that
+# repo's default branch (main/master) latest HEAD -- never committed directly
+# to main. Reruns (e.g. --force) reuse the branch if it already exists rather
+# than recreating it. After committing, we always switch back to whatever
+# branch was checked out before this stage ran (normally main) so the repo is
+# left exactly as the operator found it; only newbug/<bug_id> carries the
+# new commit, ready for review/PR.
+#
+# Parallel-safety: `git checkout` swaps the ENTIRE working tree/HEAD for the
+# whole repo, not anything path-scoped -- two pipelines reaching this stage
+# for the same repo at the same moment would stomp on each other's checkout.
+# The whole checkout->add->commit->checkout-back critical section is
+# therefore wrapped in a per-repo file lock (only one pipeline's commit_locally
+# touches a given repo's working tree at a time; every other stage, including
+# the expensive docker/agent ones, stays fully concurrent). `git add` is also
+# scoped to just this bug's own subdirectory (not the whole project dir), so
+# even under the lock, a same-project sibling bug's still-uncommitted files
+# sitting in the shared working tree can never get swept into this commit.
 
 def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
     alias = stage_data(state, "compute_alias")
@@ -1297,6 +1397,7 @@ def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
     project = report["project"]
     public_alias = stage_data(state, "scaffold_public_repo")["alias"]
     bug_id = Path(alias["bug_dir"]).name
+    branch_name = f"newbug/{bug_id}"
 
     ans_msg = f"Add {bug_id} bug bundle ({report['short_title']})"
     pub_msg = f"Add {public_alias} challenge ({report['short_title']})"
@@ -1309,26 +1410,49 @@ def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
         # every bug's build/Dockerfile + build/build.sh, so a plain `git add`
         # silently drops them. The existing 68 bugs' build/ dirs are tracked via
         # the same force-add, so this matches the established convention.
-        (ctx.answers_repo, [f"bugs/{project}", "tools/fix_commits.yaml"], ans_msg, "answers",
+        (ctx.answers_repo, [f"bugs/{project}/{bug_id}", "tools/fix_commits.yaml"], ans_msg, "answers",
          [f"bugs/{project}/{bug_id}/build"]),
-        (ctx.public_repo, [f"bugs/{project}", "tools/sealed/CHALLENGES.md", "README.md"], pub_msg, "public", []),
+        (ctx.public_repo, [f"bugs/{project}/{public_alias}", "tools/sealed/CHALLENGES.md", "README.md"],
+         pub_msg, "public", []),
     ):
-        add = git(repo, "add", *rel_paths)
-        if add.returncode != 0:
-            raise RuntimeError(f"git add failed in {repo}: {add.stderr}")
-        for fp in force_paths:
-            if (Path(repo) / fp).exists():
-                fadd = git(repo, "add", "-f", fp)
-                if fadd.returncode != 0:
-                    raise RuntimeError(f"git add -f {fp} failed in {repo}: {fadd.stderr}")
-        status = git(repo, "status", "--porcelain")
-        if not status.stdout.strip():
-            results[key] = {"committed": False, "reason": "nothing staged"}
-            continue
-        commit = git(repo, "commit", "-m", msg)
-        results[key] = {"committed": commit.returncode == 0, "stdout": commit.stdout, "stderr": commit.stderr}
-        if commit.returncode != 0:
-            raise RuntimeError(f"git commit failed in {repo}: {commit.stderr}")
+        with lib.file_lock(Path(repo) / ".git" / "fbbench-commit.lock"):
+            original_branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            base_branch = default_branch(repo)
+            if original_branch != base_branch:
+                raise RuntimeError(
+                    f"commit_locally: {repo} is currently on branch '{original_branch}', not "
+                    f"'{base_branch}' -- switch to {base_branch} yourself first so {branch_name} "
+                    f"branches from its latest HEAD, not from wherever this happens to be checked out"
+                )
+
+            branch_exists = git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}").returncode == 0
+            checkout = git(repo, "checkout", branch_name) if branch_exists else git(repo, "checkout", "-b", branch_name)
+            if checkout.returncode != 0:
+                raise RuntimeError(f"git checkout {'(reuse)' if branch_exists else '-b'} {branch_name} "
+                                    f"failed in {repo}: {checkout.stderr}")
+
+            try:
+                add = git(repo, "add", *rel_paths)
+                if add.returncode != 0:
+                    raise RuntimeError(f"git add failed in {repo}: {add.stderr}")
+                for fp in force_paths:
+                    if (Path(repo) / fp).exists():
+                        fadd = git(repo, "add", "-f", fp)
+                        if fadd.returncode != 0:
+                            raise RuntimeError(f"git add -f {fp} failed in {repo}: {fadd.stderr}")
+                status = git(repo, "status", "--porcelain")
+                if not status.stdout.strip():
+                    results[key] = {"committed": False, "reason": "nothing staged", "branch": branch_name}
+                    continue
+                commit = git(repo, "commit", "-m", msg)
+                results[key] = {"committed": commit.returncode == 0, "stdout": commit.stdout,
+                                 "stderr": commit.stderr, "branch": branch_name}
+                if commit.returncode != 0:
+                    raise RuntimeError(f"git commit failed in {repo}: {commit.stderr}")
+            finally:
+                back = git(repo, "checkout", original_branch)
+                if back.returncode != 0:
+                    raise RuntimeError(f"git checkout back to {original_branch} failed in {repo}: {back.stderr}")
 
     return {"data": results}
 
@@ -1367,6 +1491,26 @@ STAGE_NAMES = [n for n, _ in STAGES]
 
 def cmd_run(args) -> int:
     ctx = Ctx(args)
+
+    # Without this the first save_state() blows up with a bare
+    # FileNotFoundError traceback halfway through stage 0.
+    if not ctx.report_dir.is_dir():
+        print(f"no such report dir: {ctx.report_dir}", file=sys.stderr)
+        return 2
+
+    # Preflight. Worth the ~2s: several of these dependencies fail SILENTLY
+    # (no llvm-symbolizer / no llvm-14 profdata-cov => `site` and `reach`
+    # never fire and the bug just grades unsolved), and the loud ones would
+    # otherwise surface an hour and several dollars into a run.
+    if not args.skip_env_check:
+        from check_env import run_checks, format_report
+        env = run_checks(ctx.answers_repo, ctx.public_repo, ctx.oss_fuzz_repo)
+        if not env["ok"]:
+            print(format_report(env), file=sys.stderr)
+            print("\nrefusing to start. Fix the above, or re-run with --skip-env-check "
+                  "if you know this run doesn't need what's missing.", file=sys.stderr)
+            return 2
+
     state = load_state(ctx.state_file)
     state.setdefault("created_at", time.time())
 
@@ -1441,9 +1585,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run")
     add_common(p_run)
+    # Required: identity is never auto-assigned. Used verbatim -- no
+    # project-prefix validation, no collision check; an existing bundle at
+    # this id is overwritten.
+    p_run.add_argument("--bug-id", required=True,
+                        help="the exact <project>-NN to build this bug as, e.g. libxml2-03. Used "
+                             "verbatim; overwrites anything already at bugs/<project>/<bug-id>/ "
+                             "in either repo.")
     p_run.add_argument("--from-stage", default=None, choices=STAGE_NAMES)
     p_run.add_argument("--only-stage", default=None, choices=STAGE_NAMES)
     p_run.add_argument("--force", action="store_true", help="rerun a stage even if already marked done")
+    p_run.add_argument("--skip-env-check", action="store_true",
+                        help="skip the preflight dependency check (see check_env.py). Useful when "
+                             "re-running a late stage that doesn't need the missing tool.")
     p_run.set_defaults(func=cmd_run)
 
     p_list = sub.add_parser("list-stages")

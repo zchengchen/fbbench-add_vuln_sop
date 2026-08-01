@@ -222,7 +222,7 @@ RUN mkdir -p /out \\
  && /src/build/build.sh harness release-asan \\
  && /src/build/build.sh harness coverage
 
-RUN ls -la /out/*/harness
+RUN ls -la /out/*/*/harness
 """
 
     lib_build_cmd = LIB_BUILD_CMDS.get(build_system, LIB_BUILD_CMDS["unknown"])
@@ -264,7 +264,11 @@ fi
 
 if [ "${{cmd}}" = "harness" ]; then
     CONFIG="${{2:?harness needs <config>}}"
-    OUT=/out/${{CONFIG}}
+    case "${{CONFIG}}" in
+        release-asan) OUT=/out/vuln/asan ;;
+        coverage)     OUT=/out/vuln/cov ;;
+        *)            OUT=/out/vuln/${{CONFIG}} ;;
+    esac
     mkdir -p "${{OUT}}"
 
     case "${{CONFIG}}" in

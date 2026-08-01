@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>add_vuln SOP</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <div class="kick">fbbench &middot; add_vuln SOP</div>
+    <h1>Submit a bug, watch it move through the 21 stages</h1>
+    <p class="lede">Drop a report + PoC in and the real <code>pipeline.py</code> pipeline runs in the background &mdash; Docker builds and billed Claude calls included. Nothing is ever pushed to a remote.</p>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="submit">Submit</button>
+    <button class="tab-btn" data-tab="bugs">Bugs</button>
+  </nav>
+
+  <section id="tab-submit" class="tab-panel active">
+    <form id="submit-form">
+      <div class="field">
+        <label for="f-date">Date <span class="req">*</span></label>
+        <input id="f-date" name="date" type="text" placeholder="e.g. Aug 3, 2025 05:58AM" required>
+        <p class="hint">Report-filed / discovered date, as it appears in the original report.</p>
+      </div>
+
+      <div class="field">
+        <label for="f-upstream">Upstream URL <span class="req">*</span></label>
+        <input id="f-upstream" name="upstream" type="text" placeholder="e.g. https://issues.oss-fuzz.com/issues/435781342" required>
+        <p class="hint">The report/issue tracker URL. Carried through to <code>vuln.yaml</code>'s <code>upstream_report</code> field.</p>
+      </div>
+
+      <div class="field">
+        <label for="f-bug-id">Bug ID <span class="req">*</span></label>
+        <input id="f-bug-id" name="bug_id" type="text" placeholder="e.g. libxml2-05" required>
+        <p class="hint">Used verbatim as <code>&lt;project&gt;-NN</code>. If a bundle already exists under this id in either repo, it is <strong>overwritten</strong>.</p>
+      </div>
+
+      <div class="field">
+        <label for="f-report">Report <span class="req">*</span></label>
+        <textarea id="f-report" name="report" rows="14" placeholder="Paste the raw OSS-Fuzz report text here (Project:, Crash Type:, Crash State:, ...)" required></textarea>
+      </div>
+
+      <div class="field">
+        <label for="f-poc">PoC file <span class="req">*</span></label>
+        <input id="f-poc" name="poc" type="file" required>
+        <p class="hint">Must be an actual PoC input, not a <code>.txt</code> file.</p>
+      </div>
+
+      <div id="form-errors" class="errors" hidden></div>
+
+      <button type="submit" id="submit-btn">Submit &amp; start pipeline</button>
+    </form>
+  </section>
+
+  <section id="tab-bugs" class="tab-panel">
+    <div id="capacity" class="capacity" hidden></div>
+    <div id="bug-list" class="bug-list"></div>
+  </section>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

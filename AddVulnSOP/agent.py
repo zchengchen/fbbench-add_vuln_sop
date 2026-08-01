@@ -34,6 +34,8 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 
@@ -49,6 +51,42 @@ class AgentError(RuntimeError):
 
 DEFAULT_ALLOWED_TOOLS = ["Bash", "Read", "Grep", "Glob"]
 
+# Failures that say nothing about whether the TASK is doable -- re-issuing the
+# identical prompt can plausibly succeed. Retried with backoff rather than
+# killing a stage (and, with it, a pipeline run that may already be an hour
+# and many dollars deep).
+#
+# The safeguard one is the motivating case: this pipeline's prompts are
+# necessarily about crashes, UAFs, exploit reproduction and patch analysis, so
+# the classifier flags a legitimate turn now and then. It is non-deterministic
+# -- the same prompt usually sails through on a retry -- and pipeline.py
+# already attaches AUTHORIZATION_CONTEXT to every call explaining this is
+# authorized benchmark work on already-disclosed, already-fixed bugs.
+TRANSIENT_ERROR_PATTERNS = (
+    "safeguards flagged",
+    "api error",
+    "overloaded",
+    "rate limit",
+    "rate_limit",
+    "internal server error",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "connection reset",
+    "connection error",
+    "timed out",
+    " 429",
+    " 500",
+    " 502",
+    " 503",
+    " 529",
+)
+
+
+def is_transient_error(message: str) -> bool:
+    low = (message or "").lower()
+    return any(p in low for p in TRANSIENT_ERROR_PATTERNS)
+
 
 def call_agent(
     prompt: str,
@@ -62,6 +100,8 @@ def call_agent(
     timeout_s: int = 1800,
     append_system_prompt: str | None = None,
     extra_args: list[str] | None = None,
+    max_retries: int = 3,
+    retry_backoff_s: float = 10.0,
 ) -> dict:
     """Run one headless claude turn scoped to `cwd` and return:
 
@@ -74,6 +114,13 @@ def call_agent(
 
     Raises AgentError if the CLI produced no parseable JSON, or if the agent's
     own turn errored. Never silently returns a guessed/partial result.
+
+    Failures matching TRANSIENT_ERROR_PATTERNS (safeguard flags, 429/5xx,
+    network blips) are retried up to `max_retries` times with exponential
+    backoff, since they say nothing about whether the task is doable and
+    would otherwise kill a stage — and with it a pipeline run that may
+    already be hours and many dollars in. Every other failure raises
+    immediately; retrying a genuinely-impossible task just burns money.
     """
     cmd = ["claude", "-p", prompt, "--output-format", "json", "--no-session-persistence"]
 
@@ -93,6 +140,25 @@ def call_agent(
     if extra_args:
         cmd += extra_args
 
+    last_error: AgentError | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return _call_once(cmd, cwd, timeout_s, prompt)
+        except AgentError as e:
+            last_error = e
+            if attempt >= max_retries or not is_transient_error(str(e)):
+                raise
+            delay = retry_backoff_s * (2 ** attempt)
+            # stderr, so it lands in the stage's run.log without polluting the
+            # last-line-JSON stdout contract.
+            print(f"[agent] transient failure on attempt {attempt + 1}/{max_retries + 1}, "
+                  f"retrying in {delay:.0f}s: {e}", file=sys.stderr, flush=True)
+            time.sleep(delay)
+    raise last_error  # unreachable; for the type checker
+
+
+def _call_once(cmd: list[str], cwd: str | Path, timeout_s: int, prompt: str) -> dict:
+    """One `claude -p` invocation, no retry. Raises AgentError on any failure."""
     try:
         p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired as e:
