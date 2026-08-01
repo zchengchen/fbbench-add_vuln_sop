@@ -51,6 +51,11 @@ class AgentError(RuntimeError):
 
 DEFAULT_ALLOWED_TOOLS = ["Bash", "Read", "Grep", "Glob"]
 
+# Pinned explicitly rather than inheriting the CLI's account default, so a run's
+# results stay comparable across machines and across whatever /model happens to
+# be selected. Override per-run with pipeline.py --model.
+DEFAULT_MODEL = "claude-sonnet-5"
+
 # Failures that say nothing about whether the TASK is doable -- re-issuing the
 # identical prompt can plausibly succeed. Retried with backoff rather than
 # killing a stage (and, with it, a pipeline run that may already be an hour
@@ -94,7 +99,7 @@ def call_agent(
     *,
     allowed_tools: list[str] | None = None,
     permission_mode: str = "acceptEdits",
-    model: str | None = None,
+    model: str | None = DEFAULT_MODEL,
     json_schema: dict | None = None,
     max_budget_usd: float | None = None,
     timeout_s: int = 1800,
@@ -208,7 +213,7 @@ def main() -> int:
     ap.add_argument("--cwd", default=".")
     ap.add_argument("--allowed-tools", nargs="*", default=None)
     ap.add_argument("--permission-mode", default="acceptEdits")
-    ap.add_argument("--model", default=None)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--json-schema", default=None, help="inline JSON schema string")
     ap.add_argument("--max-budget-usd", type=float, default=None)
     ap.add_argument("--timeout-s", type=int, default=1800)

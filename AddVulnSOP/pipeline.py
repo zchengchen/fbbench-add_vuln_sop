@@ -40,7 +40,7 @@ sys.path.insert(0, str(SOP_DIR))
 
 import onboarding_lib as lib  # noqa: E402
 import agent as agentlib  # noqa: E402
-from agent import call_agent as _call_agent_raw, AgentError  # noqa: E402
+from agent import call_agent as _call_agent_raw, AgentError, DEFAULT_MODEL  # noqa: E402
 from ensure_mcp_server import ensure_mcp_server  # noqa: E402
 
 # On-disk layout for built harness binaries under a bug's `binaries/` dir.
@@ -1572,7 +1572,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--public-repo", default=None)
         p.add_argument("--oss-fuzz-repo", default=None)
         p.add_argument("--state-file", default=None)
-        p.add_argument("--model", default=None, help="override model for all agent calls")
+        p.add_argument("--model", default=DEFAULT_MODEL,
+                       help=f"model for all agent calls (default: {DEFAULT_MODEL})")
         p.add_argument("--corpus-workers", type=int, default=8)
         # Live grading backend baked into the public challenge image as
         # BENCH_GRADE_URL. This ngrok endpoint fronts the fbbench-grader FastAPI

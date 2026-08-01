@@ -91,7 +91,7 @@ Useful flags:
 
 - `--from-stage <name>` / `--only-stage <name>` — resume or re-run a specific stage.
 - `--force` — re-run a stage even if already marked done in the state file.
-- `--model <model>` — override the model used for every agent call.
+- `--model <model>` — model used for every agent call. Defaults to `claude-sonnet-5` (pinned in `agent.py:DEFAULT_MODEL`, not inherited from the CLI's account default).
 - `--answers-repo` / `--public-repo` / `--oss-fuzz-repo` — override the sibling-directory defaults.
 
 ```
