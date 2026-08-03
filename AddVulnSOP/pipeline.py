@@ -95,6 +95,36 @@ def call_agent(prompt, cwd, **kwargs):
 # subprocess helpers
 
 
+def bench_yaml_text(bug_id: str, project: str, is_oss_fuzz: bool, language: str,
+                     sanitizer: str, engine: str, invocation: list[str]) -> str:
+    """Serialize a bench.yaml BY HAND, for both repos' copies.
+
+    Not through lib.write_yaml, and the difference is not cosmetic. Both repos
+    read `capability_set` through fbbench/grading/bench_yaml.py's deliberately
+    tiny reader (the public repo's own tooling, plus the answers repo's
+    tools/regrade.py and tools/diffscan_report.py), and that reader recognizes a
+    list ONLY when it is written on one line as `[a, b]`. PyYAML's default block
+    style parses to '' -- falsy -- and capability_set() then silently
+    substitutes the full default ladder, scoring a bug on capabilities it was
+    never meant to be scored on. It also skips every indented line, so anything
+    nested beyond `harness:` is invisible to it. Verified against the real
+    reader both ways.
+    """
+    return "\n".join([
+        f"bug_id: {bug_id}",
+        f"project: {project}",
+        f"is_oss_fuzz: {'true' if is_oss_fuzz else 'false'}",
+        f"language: {language}",
+        "harness:",
+        f"  sanitizer: {sanitizer}",
+        f"  engine: {engine}",
+        "  invocation: [" + ", ".join(f'"{a}"' for a in invocation) + "]",
+        "",
+        "capability_set: [" + ", ".join(CAPABILITY_SET) + "]",
+        "",
+    ])
+
+
 def run_tool(script: str, args: list[str], timeout_s: int = 600) -> dict:
     """Shell out to an AddVulnSOP/<script>.py CLI, parse its last-line JSON."""
     cmd = [sys.executable, str(SOP_DIR / script)] + [str(a) for a in args]
@@ -1200,19 +1230,12 @@ def stage_write_answers_docs(ctx: Ctx, state: dict) -> dict:
     # vuln.yaml -- omitting it here makes grade.go silently drop to a 4-flag
     # default that excludes "differential" from scoring. Real bugs (e.g.
     # skia-01) carry it in bench.yaml too. `language` is top-level now.
-    bench = {
-        "bug_id": bug_dir.name,
-        "project": report["project"],
-        "is_oss_fuzz": bool(hm.get("is_oss_fuzz", True)),
-        "language": language,
-        "harness": {
-            "sanitizer": hm.get("sanitizer") or report.get("sanitizer") or "asan",
-            "engine": hm.get("engine") or ("jazzer" if language == "jvm" else "libfuzzer"),
-            "invocation": hm.get("invocation") or ["@@"],
-        },
-        "capability_set": CAPABILITY_SET,
-    }
-    lib.write_yaml(bug_dir / "bench.yaml", bench)
+    (bug_dir / "bench.yaml").write_text(bench_yaml_text(
+        bug_id=bug_dir.name, project=report["project"],
+        is_oss_fuzz=bool(hm.get("is_oss_fuzz", True)), language=language,
+        sanitizer=hm.get("sanitizer") or report.get("sanitizer") or "asan",
+        engine=hm.get("engine") or ("jazzer" if language == "jvm" else "libfuzzer"),
+        invocation=hm.get("invocation") or ["@@"]))
 
     prompt = f"""Write description.txt (and, if there is provenance worth keeping, an optional NOTES.md) in \
 the current directory (the bug's answers-repo bundle) for a new benchmark challenge. Full context:
@@ -1434,27 +1457,12 @@ def stage_scaffold_public_repo(ctx: Ctx, state: dict) -> dict:
     # silently grade a bug on capabilities it was never meant to be scored on
     # (sweep/orchestrator.py, sweep/claudecode.py, tools/sealed/verify_sealed.py,
     # tools/sealed/verify_canonical.py all take that fallback).
-    # Written as text rather than via lib.write_yaml, because PyYAML's default
-    # block style is not merely a cosmetic mismatch here: read_bench() only
-    # recognizes a list written on ONE line as `[a, b]`. Dumped as a block list
-    # ("capability_set:" then "- class" ...) it parses to '' -- falsy -- and the
-    # caller silently takes the default-ladder fallback. Verified against the
-    # reader both ways before choosing this.
-    invocation = hm.get("invocation") or ["@@"]
-    pub_bench = "\n".join([
-        f"bug_id: {alias}",
-        f"project: {project}",
-        f"is_oss_fuzz: {'true' if hm.get('is_oss_fuzz', True) else 'false'}",
-        f"language: {language}",
-        "harness:",
-        f"  sanitizer: {hm.get('sanitizer') or report.get('sanitizer') or 'asan'}",
-        f"  engine: {hm.get('engine') or ('jazzer' if language == 'jvm' else 'libfuzzer')}",
-        "  invocation: [" + ", ".join(f'"{a}"' for a in invocation) + "]",
-        "",
-        "capability_set: [" + ", ".join(CAPABILITY_SET) + "]",
-        "",
-    ])
-    (pub_dir / "bench.yaml").write_text(pub_bench)
+    (pub_dir / "bench.yaml").write_text(bench_yaml_text(
+        bug_id=alias, project=project,
+        is_oss_fuzz=bool(hm.get("is_oss_fuzz", True)), language=language,
+        sanitizer=hm.get("sanitizer") or report.get("sanitizer") or "asan",
+        engine=hm.get("engine") or ("jazzer" if language == "jvm" else "libfuzzer"),
+        invocation=hm.get("invocation") or ["@@"]))
 
     # Public bug dir carries the harness SOURCE (harness/) plus build.sh (the
     # answers build/build.sh copied to the public harness/build.sh, matching the
