@@ -393,6 +393,53 @@ RESOLVE_VULN_SCHEMA = {
 }
 
 
+def _pin_vintage_trees(ctx: Ctx, report: dict, clone: dict, vuln_commit: str) -> dict:
+    """Materialize the two era-pinned worktrees a harness may legitimately be
+    copied from (see harness_vintage.py). Without these, every stage that reads
+    source from the shared clone reads TODAY's code while the image builds the
+    library at vuln_commit -- a skew that only surfaces minutes later as an
+    unexplained compile error, or worse, as silently wrong expected.yaml lines.
+
+    oss-fuzz is anchored on when the bug was REPORTED (that is the state of the
+    harness that actually produced the crash), falling back through the coarse
+    regression window to no anchor at all, in which case harness_vintage.py
+    says so rather than pretending the tree is pinned."""
+    anchor = report.get("report_filed_at") or report.get("regression_window_end")
+    args = [
+        "pin", "--clone-dir", clone["clone_dir"], "--vuln-commit", vuln_commit,
+        "--oss-fuzz-repo", str(ctx.oss_fuzz_repo), "--tag", ctx.report_dir.name,
+    ]
+    if anchor:
+        args += ["--anchor-date", anchor]
+    pinned = run_tool("harness_vintage.py", args, timeout_s=600)
+    if pinned.get("error"):
+        raise RuntimeError(f"could not pin the era source trees: {pinned['error']}")
+    pinned.pop("vuln_commit", None)  # already the caller's own key; don't shadow it
+    return pinned
+
+
+def _ensure_vintage_trees(ctx: Ctx, report: dict, clone: dict, vuln: dict) -> None:
+    """Make sure the era-pinned worktrees exist ON DISK, rebuilding them if not.
+
+    The state file records absolute /tmp paths, and /tmp does not survive a
+    reboot or a system cleanup -- so "the key is present in state" says nothing
+    about whether the directory is still there. A resumed run days later, or one
+    that outlives a /tmp sweep, has to re-materialize them. (Cheap: worktrees
+    share the clone's object store.) This also covers state files written before
+    era-pinning existed, which carry no paths at all."""
+    have = (vuln.get("vuln_src_dir") and Path(vuln["vuln_src_dir"]).is_dir()
+            and vuln.get("ossfuzz_src_dir") and Path(vuln["ossfuzz_src_dir"]).is_dir())
+    if have:
+        return
+    if not Path(clone["clone_dir"]).is_dir():
+        raise RuntimeError(
+            f"the upstream clone {clone['clone_dir']} no longer exists (a /tmp cleanup or a reboot "
+            f"will do this), so the era-pinned source trees cannot be rebuilt from it. Re-run with "
+            f"--from-stage clone_upstream to re-clone, then continue."
+        )
+    vuln.update(_pin_vintage_trees(ctx, report, clone, vuln["vuln_commit"]))
+
+
 def stage_resolve_vuln_commit(ctx: Ctx, state: dict) -> dict:
     report = stage_data(state, "parse_report")
     clone = stage_data(state, "clone_upstream")
@@ -406,13 +453,15 @@ def stage_resolve_vuln_commit(ctx: Ctx, state: dict) -> dict:
         rc = run_tool("resolve_vuln_fix_commits.py", [
             "--repo-url", clone["repo_url"], "--clone-dir", clone_dir,
         ], timeout_s=600)
-        return {"data": {
+        data = {
             # resolve_vuln_fix_commits.py now emits the resolved commit as
             # `vuln_version` (its vuln.yaml home); we keep the pipeline-internal
             # key `vuln_commit` and only rename it at the vuln.yaml write site.
             "vuln_commit": rc["vuln_version"], "fix_commit": None,
             "confirmed_signature_match": None, "notes": "unfixed upstream; vuln_commit=HEAD",
-        }}
+        }
+        data.update(_pin_vintage_trees(ctx, report, clone, data["vuln_commit"]))
+        return {"data": data}
 
     fix_commit = fix["fix_commit"]
     report_filed_at = report.get("report_filed_at")
@@ -475,6 +524,7 @@ Do not stop at a plausible-looking commit without actually running the tool agai
     if not data or not data.get("confirmed_signature_match"):
         raise RuntimeError(f"resolve_vuln_commit: bisection did not confirm a matching signature: {out['result']!r}")
     data["fix_commit"] = fix_commit
+    data.update(_pin_vintage_trees(ctx, report, clone, data["vuln_commit"]))
     return {"data": data, "cost_usd": out["cost_usd"]}
 
 
@@ -534,12 +584,38 @@ SCAFFOLD_HARNESS_SCHEMA = {
                 "timeout_s": {"type": ["integer", "null"]},
                 "provenance": {"type": "string", "description": "oss-fuzz if the fuzz target is upstream's own; fuzzingbrain if hand-authored"},
                 "is_oss_fuzz": {"type": "boolean", "description": "true if this bug's fuzz target is an official OSS-Fuzz target"},
+                "build_route": {
+                    "type": "string",
+                    "description": "how build.sh builds: 'ossfuzz-build-sh' if it invokes the project's own "
+                                   "OSS-Fuzz build script under an emulated base-builder env (STRONGLY "
+                                   "preferred), 'handrolled' if you wrote the compile/link lines yourself, "
+                                   "'hybrid' if you drove the OSS-Fuzz script for some configs only. Say "
+                                   "what you actually did.",
+                },
             },
             "required": ["language", "build_system", "harness_type", "entrypoint", "engine",
-                         "sanitizer", "invocation", "provenance", "is_oss_fuzz"],
+                         "sanitizer", "invocation", "provenance", "is_oss_fuzz", "build_route"],
+        },
+        "verification": {
+            "type": "object",
+            "description": "what you OBSERVED when you built the image and ran the real PoC through it. "
+                           "Checked against the bug report by the caller, so paste what the run actually "
+                           "printed -- a reconstruction from the report will not match and will fail the "
+                           "stage.",
+            "properties": {
+                "image_built": {"type": "boolean", "description": "docker build succeeded"},
+                "poc_reproduced": {"type": "boolean",
+                                    "description": "the release-asan binary CRASHED on this bug's own PoC"},
+                "asan_summary": {"type": "string",
+                                  "description": "the SUMMARY: line the run printed, verbatim ('' if none)"},
+                "top_frames": {"type": "array", "items": {"type": "string"},
+                                "description": "innermost-first function names from the crash you observed"},
+                "build_command": {"type": "string", "description": "the docker build command you ran"},
+            },
+            "required": ["image_built", "poc_reproduced", "asan_summary", "top_frames"],
         },
     },
-    "required": ["ok", "harness_meta"],
+    "required": ["ok", "harness_meta", "verification"],
 }
 
 
@@ -551,6 +627,10 @@ def stage_scaffold_harness(ctx: Ctx, state: dict) -> dict:
     project = report["project"]
     bug_dir = Path(alias["bug_dir"])
     vuln_commit = vuln["vuln_commit"]
+    _ensure_vintage_trees(ctx, report, clone, vuln)
+    vuln_src_dir = vuln["vuln_src_dir"]
+    ossfuzz_src_dir = vuln["ossfuzz_src_dir"]
+    poc_path = (ctx.report_dir / report["poc_filename"]).resolve()
 
     sibling = run_tool("find_sibling_bundle.py", ["--project", project, "--answers-repo", str(ctx.answers_repo)])
 
@@ -563,10 +643,12 @@ def stage_scaffold_harness(ctx: Ctx, state: dict) -> dict:
             f"Sibling bench.yaml/vuln.yaml metadata: {json.dumps(sibling['sibling_bench'])}\n"
             f"This new bug's fuzz target is '{report['fuzz_target']}', which may DIFFER from the "
             f"sibling's fuzz target -- adapt build/build.sh to build and link the correct "
-            f"OSS-Fuzz fuzz-target source for '{report['fuzz_target']}' (inspect the cloned repo at "
-            f"{clone['clone_dir']} -- likely under fuzz/ -- and how the project's own "
-            f"fuzz/oss-fuzz-build.sh or build.sh compiles/links that specific target) rather than "
-            f"reusing the sibling's fuzz target verbatim."
+            f"OSS-Fuzz fuzz-target source for '{report['fuzz_target']}' (inspect the pinned trees "
+            f"described below and how the project's own fuzz/oss-fuzz-build.sh or build.sh "
+            f"compiles/links that specific target) rather than reusing the sibling's fuzz target "
+            f"verbatim. The sibling's harness files are listed by NAME only on purpose -- copy this "
+            f"bug's harness from the pinned trees, never from the sibling bundle (the sibling was "
+            f"pinned to ITS OWN bug's era, which is not this one)."
         )
     else:
         derived = run_tool("derive_dockerfile.py", [
@@ -578,8 +660,7 @@ def stage_scaffold_harness(ctx: Ctx, state: dict) -> dict:
             f"(may contain TODO placeholders -- see warnings) is:\nbuild/Dockerfile:\n```\n{derived['dockerfile']}\n```\n"
             f"build/build.sh:\n```\n{derived['harness_build_sh']}\n```\n"
             f"Generator warnings: {derived.get('warnings')}\n"
-            f"Resolve every TODO by inspecting the cloned repo at {clone['clone_dir']} and the "
-            f"oss-fuzz project files at {ctx.oss_fuzz_repo / 'projects' / project}."
+            f"Resolve every TODO by inspecting the two pinned trees described below."
         )
 
     prompt = f"""Write build/Dockerfile and build/build.sh (relative to your cwd, which IS that bug \
@@ -597,26 +678,133 @@ then `COPY harness/ /src/harness/` and `COPY build/build.sh /src/build/build.sh`
 RUN harness for debug, debug-asan, release-asan, coverage configs (all invoked as /src/build/build.sh ...) \
 -- mirror the exact shape/flags of the reference above unless this project's build system genuinely \
 differs. build/build.sh must implement the `build-libs` / `harness <config>` subcommand contract (see \
-reference). You have Bash access to explore the cloned repo at {clone['clone_dir']} (read-only exploration \
-is fine; do not modify it) to confirm the real fuzz-target source path and its exact compile/link flags \
-before writing the build script -- do not guess.
+reference).
+
+WHERE THE HARNESS SOURCE MUST COME FROM -- this is not a detail, getting it wrong breaks the build in a \
+way that is expensive to diagnose. You have read-only Bash access to TWO trees, both already checked out \
+at THIS BUG'S ERA (do not modify either):
+
+  {vuln_src_dir}
+      the project's own tree at exactly {vuln_commit} -- the same commit the Dockerfile checks out.
+      Projects that ship their fuzz harness upstream (e.g. a fuzz/ or tests/fuzz/ directory) keep it here.
+
+  {ossfuzz_src_dir}
+      the oss-fuzz repo at commit {vuln['ossfuzz_commit'][:12]}, its state when this bug was reported.
+      Roughly a fifth of oss-fuzz projects ship the harness in projects/{project}/*.c instead of upstream;
+      if projects/{project}/build.sh compiles a $SRC/*.c that is NOT in the project's own tree, that file
+      lives here.
+
+Copy the harness from whichever of those two trees actually hosts it. Do NOT read the harness out of any \
+other checkout, and do NOT reconstruct it from memory of the project's current code: both trees are \
+deliberately old, and today's harness routinely calls APIs that did not exist at {vuln_commit[:12]} -- it \
+will fail to compile against the library this image builds. If the harness genuinely lives in neither tree \
+(a separate fuzzer repo cloned by the oss-fuzz Dockerfile, or a target you must hand-write), that is fine \
+and expected -- write it, and say so via harness_meta.provenance.
+
+IF IT ALREADY EXISTS, CALL IT -- DO NOT REWRITE IT. OSS-Fuzz already ships a working build recipe for this \
+project: {ossfuzz_src_dir}/projects/{project}/build.sh (which often just delegates again, to a script inside \
+the project's own tree such as fuzz/oss-fuzz-build.sh). That recipe is the one that actually produced this \
+crash upstream. Your build/build.sh should therefore INVOKE it, setting up the handful of environment \
+variables OSS-Fuzz's base-builder image would have provided ($SRC, $OUT, $WORK, $CC, $CXX, $CFLAGS, \
+$CXXFLAGS, $LIB_FUZZING_ENGINE, $SANITIZER, $ARCHITECTURE), and then move/rename whatever it produced into \
+this bundle's own /out/vuln/<config>/harness layout. Re-deriving the compile and link command lines by hand \
+is a LAST RESORT, only for what that script genuinely cannot give you (e.g. a config it does not support). \
+Hand-written command lines silently drop things base-builder sets for every project -- \
+-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION alone changes real parsing/encoding behaviour in many projects, \
+and a build missing it compiles and runs perfectly while no longer reproducing the bug at all. State which \
+route you took in harness_meta.build_route.
+
+Read the flags out of {ossfuzz_src_dir}/infra/base-images/ (base-clang's ENV CFLAGS, base-builder's \
+SANITIZER_FLAGS_* / COVERAGE_FLAGS) rather than recalling them -- that tree is pinned to this bug's era, so \
+what it says is what this bug was found with.
+
+Confirm the real fuzz-target source path and its exact compile/link flags from these trees before writing \
+the build script -- do not guess.
+
+YOU MUST PROVE THE BUILD REPRODUCES THE BUG BEFORE YOU RETURN. Writing files that compile is not the \
+deliverable -- a bundle whose binary does not crash is worthless, and "it built and ran on a sample input" \
+does not test that. Do all of this yourself, with Bash, before reporting ok:
+
+  1. `docker build` this bug directory with build/Dockerfile.
+  2. Run the release-asan binary the image produced against THIS BUG'S ACTUAL PoC:
+       {poc_path}
+  3. Confirm it crashes, and that the crash is THIS bug and not some other one:
+       expected crash type : {report['crash_type']}
+       expected top frames : {' <- '.join(report['crash_state_functions'])}
+  4. If it does not crash, or crashes somewhere else, the build is wrong -- FIX IT AND GO BACK TO 1. \
+Do not report ok, do not explain it away, and do not leave it for a later stage to discover. A build that \
+compiles cleanly but does not reproduce almost always means the build configuration drifted from OSS-Fuzz's \
+(see the flags note above), not that the PoC or the commit is wrong -- both of those were already verified \
+before this stage ran.
+
+Report what you actually observed in `verification`: the exact ASan summary line and the top frames you \
+got. These are checked against the report, so do not paraphrase or reconstruct them from the report text -- \
+paste what the run printed.
 
 Finally, report `harness_meta` describing exactly what you encoded (language, build_system, harness_type, \
-entrypoint, engine, sanitizer, invocation, rss_limit_mb, timeout_s, provenance, is_oss_fuzz). These drive \
-the generated bench.yaml/vuln.yaml, so they must match the build/Dockerfile + build/build.sh you wrote."""
+entrypoint, engine, sanitizer, invocation, rss_limit_mb, timeout_s, provenance, is_oss_fuzz, build_route). \
+These drive the generated bench.yaml/vuln.yaml, so they must match the build/Dockerfile + build/build.sh \
+you wrote."""
 
     out = call_agent(
         prompt, cwd=bug_dir,
         allowed_tools=["Bash", "Read", "Write", "Grep", "Glob"],
         model=ctx.model,
         json_schema=SCAFFOLD_HARNESS_SCHEMA,
-        timeout_s=1800,
-        max_budget_usd=5.0,
-        extra_args=["--add-dir", clone["clone_dir"]],
+        # This stage no longer just writes files: it now has to docker-build the
+        # bundle and reproduce the PoC, and iterate when that fails. One build of
+        # a mid-size C project across four configs is already several minutes, so
+        # the old 30-minute/$5 envelope would time out mid-fix and leave a bundle
+        # that was never actually verified -- exactly what this change exists to
+        # prevent. The cost lands here instead of at stage 7, not on top of it.
+        timeout_s=5400,
+        max_budget_usd=10.0,
+        extra_args=["--add-dir", vuln_src_dir, "--add-dir", ossfuzz_src_dir],
     )
     data = out["structured_output"] or {"ok": False, "warnings": ["no structured_output returned"]}
     if not (bug_dir / "build" / "Dockerfile").is_file() or not (bug_dir / "build" / "build.sh").is_file():
         raise RuntimeError(f"scaffold_harness: agent did not write build/Dockerfile + build/build.sh: {out['result']!r}")
+
+    # The agent is required to have built the image and reproduced the crash
+    # itself. Trusting the boolean alone would be worth little -- the previous
+    # incarnation of this stage cheerfully reported "verified end-to-end: builds
+    # and runs successfully against a sample HTML input", which is true and
+    # entirely beside the point -- so the reported signature is matched against
+    # the report the same way build_release_asan does it.
+    ver = data.get("verification") or {}
+    if not ver.get("poc_reproduced"):
+        raise RuntimeError(
+            "scaffold_harness: the agent did not reproduce this bug's PoC with the build it wrote "
+            f"(image_built={ver.get('image_built')}, asan_summary={ver.get('asan_summary')!r}). "
+            "A build that compiles but does not crash is not a usable bundle."
+        )
+    # Deliberately NOT checked here: whether the observed frames match the
+    # report's "Crash State". That block is not a plain crash-stack function
+    # list -- its lines can be file names, and for use-after-free the later ones
+    # name the FREE site, which never appears in the crash stack at all -- so
+    # matching against it rejected correct builds. resolve_vuln_commit already
+    # confirmed the signature at this commit; here, crashing on the PoC is the
+    # bar. The observed summary/frames are still recorded above for review.
+
+    # Fail HERE rather than letting a version-skewed harness reach the docker
+    # build several minutes later, where the only symptom is a clang error about
+    # an unknown type. See harness_vintage.py for what each verdict means.
+    vintage = run_tool("harness_vintage.py", [
+        "check", "--harness-dir", str(bug_dir / "harness"),
+        "--clone-dir", clone["clone_dir"], "--vuln-commit", vuln_commit,
+        "--upstream-head", clone["vuln_version"],
+        "--oss-fuzz-repo", str(ctx.oss_fuzz_repo), "--ossfuzz-commit", vuln["ossfuzz_commit"],
+    ], timeout_s=600)
+    data["harness_vintage"] = vintage
+    if vintage.get("error"):
+        raise RuntimeError(f"scaffold_harness: could not verify harness vintage: {vintage['error']}")
+    if not vintage["ok"]:
+        raise RuntimeError(
+            "scaffold_harness: harness/ is version-skewed against the commit this image builds:\n  "
+            + "\n  ".join(vintage["violations"])
+            + f"\nCopy the harness from {vuln_src_dir} or {ossfuzz_src_dir} instead."
+        )
+    data.setdefault("warnings", []).extend(vintage["warnings"])
     return {"data": data, "cost_usd": out["cost_usd"]}
 
 
@@ -757,14 +945,36 @@ directly (you have Write access) so BOTH binaries build the same corrected way, 
 and harness_build_modified=true, and explain the harness fix you made in root_cause/notes. Both \
 release-asan and fixed-asan will automatically be rebuilt from your corrected script and rescanned."""
 
-    out = call_agent(
-        prompt, cwd=bug_dir,
-        allowed_tools=["Bash", "Read", "Write", "Grep", "Glob"],
-        model=ctx.model,
-        json_schema=HANDLE_ANOMALY_SCHEMA,
-        timeout_s=3600,
-        max_budget_usd=8.0,
-    )
+    # Best-effort by design. This bug's own differential is already PROVEN by the
+    # two preceding stages -- build_release_asan requires the PoC to crash
+    # vuln-asan, build_fixed_asan requires it not to crash fixed-asan -- and a
+    # corpus anomaly cannot undo that. What remains is a quality problem on OTHER
+    # inputs: a fixed-asan that still crashes on unrelated historical corpus
+    # entries can swallow a genuine solve (the candidate PoC trips the unrelated
+    # crash too, so differential never fires) -- a false NEGATIVE, and only for
+    # submitted candidates, never for this bug's own scoring baseline. Not worth
+    # discarding an hour of Docker builds and billed agent calls, so the run keeps
+    # going and says so loudly. `anomaly_unresolved` is carried in state for
+    # review -- see rebuild_fixed_asan_with_patch, which does the same.
+    try:
+        out = call_agent(
+            prompt, cwd=bug_dir,
+            allowed_tools=["Bash", "Read", "Write", "Grep", "Glob"],
+            model=ctx.model,
+            json_schema=HANDLE_ANOMALY_SCHEMA,
+            timeout_s=3600,
+            max_budget_usd=8.0,
+        )
+    except Exception as e:
+        print(f"[warn]  handle_corpus_anomaly: the agent did not finish ({type(e).__name__}: {e}). "
+              f"Continuing with the fixed-asan oracle left UNCLEAN -- it still crashes on "
+              f"{len(fixed_summaries)} historical corpus input(s), which can swallow a genuine solve "
+              f"(false negative). This bug's own differential is unaffected. Re-run "
+              f"--from-stage handle_corpus_anomaly to try again.")
+        return {"data": {"needs_patch": False, "harness_build_modified": False,
+                         "anomaly_unresolved": True,
+                         "unresolved_summaries": fixed_summaries,
+                         "notes": f"agent failed: {type(e).__name__}: {e}"}}
     data = out["structured_output"] or {"needs_patch": False, "notes": "no structured_output"}
     return {"data": data, "cost_usd": out["cost_usd"]}
 
@@ -804,8 +1014,15 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
             "--harness", str(bug_dir / BIN_FIXED_ASAN),
             "--download-corpus", "--workers", str(ctx.corpus_workers),
         ], timeout_s=3600)
+        # Not fatal: the patch didn't fully clean the oracle, but the bundle
+        # itself is still sound (target bug reproduces, fix_commit fixes it).
+        # Flag it and move on rather than discarding the whole run.
         if rescan.get("summaries"):
-            raise RuntimeError(f"fixed-asan still not clean after patch: {rescan['summaries']}")
+            print(f"[warn]  rebuild_fixed_asan_with_patch: fixed-asan is STILL not clean after the patch "
+                  f"-- {len(rescan['summaries'])} historical corpus input(s) still crash it. Continuing; "
+                  f"a submitted PoC that also trips one of those will be scored as unsolved.")
+            result["anomaly_unresolved"] = True
+            result["unresolved_summaries"] = rescan["summaries"]
         result["fixed_asan_patch"] = {"build": build, "rescan": rescan}
 
     if harness_modified:
@@ -845,8 +1062,14 @@ def stage_rebuild_fixed_asan_with_patch(ctx: Ctx, state: dict) -> dict:
                 "--harness", str(bug_dir / BIN_FIXED_ASAN),
                 "--download-corpus", "--workers", str(ctx.corpus_workers),
             ], timeout_s=3600)
+            # Same call as above: an unclean oracle is a quality flag, not a
+            # reason to throw away a completed build.
             if fixed_rescan.get("summaries"):
-                raise RuntimeError(f"fixed-asan still not clean after harness fix: {fixed_rescan['summaries']}")
+                print(f"[warn]  rebuild_fixed_asan_with_patch: fixed-asan is STILL not clean after the "
+                      f"harness fix -- {len(fixed_rescan['summaries'])} historical corpus input(s) still "
+                      f"crash it. Continuing; a submitted PoC that also trips one of those scores as unsolved.")
+                result["anomaly_unresolved"] = True
+                result["unresolved_summaries"] = fixed_rescan["summaries"]
 
         result["harness_rebuild"] = {
             "vuln_build": vuln_build, "vuln_check": vuln_check, "vuln_rescan": vuln_rescan,
@@ -881,15 +1104,27 @@ def stage_gen_expected_yaml(ctx: Ctx, state: dict) -> dict:
     alias = stage_data(state, "compute_alias")
     report = stage_data(state, "parse_report")
     clone = stage_data(state, "clone_upstream")
+    vuln = stage_data(state, "resolve_vuln_commit")
     bug_dir = Path(alias["bug_dir"])
     poc_path = (ctx.report_dir / report["poc_filename"]).resolve()
 
+    # The trace's line numbers come from a binary built at vuln_commit, so the
+    # source they are resolved against must be that same commit. Pointed at the
+    # clone's master tree instead, gen_expected_yaml.py's brace-matching walks
+    # today's file and can name the wrong enclosing function -- and unlike a
+    # skewed harness, nothing downstream would ever fail loudly about it.
+    _ensure_vintage_trees(ctx, report, clone, vuln)
     draft = run_tool("gen_expected_yaml.py", [
         "--harness", str(bug_dir / BIN_VULN_ASAN),
         "--poc", str(poc_path),
-        "--src-dir", clone["clone_dir"],
+        "--src-dir", vuln["vuln_src_dir"],
         "--bug-id", alias["alias"],
     ], timeout_s=120)
+    # Stop here rather than at regrade_verify (stage 17), which is where an
+    # ungradeable `site` would otherwise surface -- after the fixed build, the
+    # corpus scan, the coverage build and the public bundle are all done.
+    if draft.get("fatal"):
+        raise RuntimeError(f"gen_expected_yaml: {draft['fatal']}")
     return {"data": draft}
 
 
@@ -899,7 +1134,9 @@ FINALIZE_EXPECTED_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boo
 def stage_finalize_expected_yaml(ctx: Ctx, state: dict) -> dict:
     alias = stage_data(state, "compute_alias")
     draft = stage_data(state, "gen_expected_yaml")
+    vuln = stage_data(state, "resolve_vuln_commit")
     bug_dir = Path(alias["bug_dir"])
+    vuln_src_dir = vuln.get("vuln_src_dir")
 
     prompt = f"""Write grader/expected.yaml (relative to your cwd, the bug directory) from this REAL, \
 already-derived ASan-trace data -- do not invent or adjust any file/function/line value yourself, only \
@@ -912,7 +1149,9 @@ site: {json.dumps(draft['site'])}
 warnings from the generator: {draft.get('warnings')}
 
 If warnings indicate missing file/line/function data, you may re-derive by reading the raw_trace below \
-and the source at {{clone_dir}}, but never fabricate a plausible-sounding line number.
+and the source at {vuln_src_dir} (that tree is checked out at the exact commit this bug's binaries were \
+built from, so its line numbers line up with the trace), but never fabricate a plausible-sounding line \
+number.
 raw_trace: {json.dumps(draft.get('raw_trace'))}"""
 
     out = call_agent(
@@ -921,6 +1160,7 @@ raw_trace: {json.dumps(draft.get('raw_trace'))}"""
         model=ctx.model,
         json_schema=FINALIZE_EXPECTED_SCHEMA,
         timeout_s=300,
+        extra_args=["--add-dir", vuln_src_dir] if vuln_src_dir else None,
     )
     if not (bug_dir / "grader" / "expected.yaml").is_file():
         raise RuntimeError(f"finalize_expected_yaml: expected.yaml not written: {out['result']!r}")
@@ -1418,12 +1658,31 @@ def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
         with lib.file_lock(Path(repo) / ".git" / "fbbench-commit.lock"):
             original_branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
             base_branch = default_branch(repo)
+            recovered_from = None
             if original_branch != base_branch:
-                raise RuntimeError(
-                    f"commit_locally: {repo} is currently on branch '{original_branch}', not "
-                    f"'{base_branch}' -- switch to {base_branch} yourself first so {branch_name} "
-                    f"branches from its latest HEAD, not from wherever this happens to be checked out"
-                )
+                # These repos are a SHARED working tree, so `git checkout` here is
+                # a global side effect and the tree can be found parked on someone
+                # else's branch: a sibling run SIGKILLed between its checkout and
+                # its checkout-back (the `finally` below never runs), or an
+                # operator who switched over to read a committed bundle. Both are
+                # routine, so recover from them -- but only from OUR OWN branches,
+                # and only when git can move cleanly: uncommitted work is the
+                # operator's and not ours to discard, and cutting this bug's
+                # branch from the wrong base is worse than not cutting it.
+                if not original_branch.startswith("newbug/"):
+                    raise RuntimeError(
+                        f"commit_locally: {repo} is currently on branch '{original_branch}', not "
+                        f"'{base_branch}' -- switch to {base_branch} yourself first so {branch_name} "
+                        f"branches from its latest HEAD, not from wherever this happens to be checked out"
+                    )
+                to_base = git(repo, "checkout", base_branch)
+                if to_base.returncode != 0:
+                    raise RuntimeError(
+                        f"commit_locally: {repo} was left parked on '{original_branch}' and could not be "
+                        f"returned to '{base_branch}' automatically: {to_base.stderr.strip()} -- resolve "
+                        f"those changes yourself, then re-run this stage."
+                    )
+                recovered_from, original_branch = original_branch, base_branch
 
             branch_exists = git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}").returncode == 0
             checkout = git(repo, "checkout", branch_name) if branch_exists else git(repo, "checkout", "-b", branch_name)
@@ -1442,11 +1701,15 @@ def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
                             raise RuntimeError(f"git add -f {fp} failed in {repo}: {fadd.stderr}")
                 status = git(repo, "status", "--porcelain")
                 if not status.stdout.strip():
-                    results[key] = {"committed": False, "reason": "nothing staged", "branch": branch_name}
+                    results[key] = {"committed": False, "reason": "nothing staged", "branch": branch_name,
+                                     "recovered_from_branch": recovered_from}
                     continue
                 commit = git(repo, "commit", "-m", msg)
                 results[key] = {"committed": commit.returncode == 0, "stdout": commit.stdout,
-                                 "stderr": commit.stderr, "branch": branch_name}
+                                 "stderr": commit.stderr, "branch": branch_name,
+                                 # non-null == the tree was parked on another bug's
+                                 # branch and this stage put it back before starting
+                                 "recovered_from_branch": recovered_from}
                 if commit.returncode != 0:
                     raise RuntimeError(f"git commit failed in {repo}: {commit.stderr}")
             finally:

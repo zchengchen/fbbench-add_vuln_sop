@@ -85,7 +85,15 @@ def parse_asan_output(stderr_text: str) -> dict:
     for fm in FRAME_RE.finditer(stderr_text):
         frames.append({
             "function": fm.group(1),
+            # Both forms, deliberately. `file` is the basename expected.yaml
+            # records; `path` is the full path, which callers need because the
+            # grading oracle decides "is this a harness frame?" from the PATH
+            # (grade.go's isHarnessFrame -> "/harness/" in the path), not from
+            # the filename. Keeping only the basename here silently destroyed
+            # that signal and let gen_expected_yaml.py anchor `site` on frames
+            # the oracle skips -- an expected.yaml that can never grade solved.
             "file": os.path.basename(fm.group(2)),
+            "path": fm.group(2),
             "line": int(fm.group(3)),
         })
         if len(frames) >= 8:

@@ -34,7 +34,9 @@ function renderDetail(d) {
   const detail = $("#bug-detail");
   const label = d.bug_id || d.id;
   document.title = `${label} · add_vuln SOP`;
-  $("#page-title").textContent = label;
+  // Same headline as the bug list: the issue's own summary, with the id after
+  // it. Older runs carry no title and keep showing just the id.
+  $("#page-title").textContent = d.title ? `${d.title} (${label})` : label;
 
   const stagesByPhase = PHASES.map((ph) => ({
     ...ph,

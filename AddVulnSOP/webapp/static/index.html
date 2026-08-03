@@ -20,17 +20,28 @@
   </nav>
 
   <section id="tab-submit" class="tab-panel active">
-    <form id="submit-form">
+    <form id="submit-form" action="/api/bugs" method="post" enctype="multipart/form-data">
+      <div class="field">
+        <label for="f-upstream">Upstream URL <span class="req">*</span></label>
+        <div class="fetch-row">
+          <input id="f-upstream" name="upstream" type="text" placeholder="e.g. https://issues.oss-fuzz.com/issues/435781342" required>
+          <button type="button" id="fetch-btn">Fetch</button>
+        </div>
+        <p class="hint">The report/issue tracker URL. Carried through to <code>vuln.yaml</code>'s <code>upstream_report</code> field.
+          <strong>Fetch</strong> reads a public OSS-Fuzz issue and fills in title, date, report and PoC below &mdash; every field stays editable, and you can skip it and type everything by hand.</p>
+        <div id="fetch-status" class="fetch-status" hidden></div>
+      </div>
+
+      <div class="field">
+        <label for="f-title">Title <span class="req">*</span></label>
+        <input id="f-title" name="title" type="text" placeholder="e.g. libxml2:html: Heap-buffer-overflow in xmlSAX2Text" required>
+        <p class="hint">The issue's own one-line summary. Shown in the bug list and written to <code>report.txt</code>'s <code>title:</code> header.</p>
+      </div>
+
       <div class="field">
         <label for="f-date">Date <span class="req">*</span></label>
         <input id="f-date" name="date" type="text" placeholder="e.g. Aug 3, 2025 05:58AM" required>
         <p class="hint">Report-filed / discovered date, as it appears in the original report.</p>
-      </div>
-
-      <div class="field">
-        <label for="f-upstream">Upstream URL <span class="req">*</span></label>
-        <input id="f-upstream" name="upstream" type="text" placeholder="e.g. https://issues.oss-fuzz.com/issues/435781342" required>
-        <p class="hint">The report/issue tracker URL. Carried through to <code>vuln.yaml</code>'s <code>upstream_report</code> field.</p>
       </div>
 
       <div class="field">

@@ -72,7 +72,11 @@ _SANITIZER_ABBREV = {
 def pick_anchor_frame(top_frames: list[dict]) -> tuple[dict | None, int]:
     """Return (frame, index) for the first frame that looks like library code,
     not fuzzer-harness glue. Falls back to frame 0 if every frame looks like
-    an entrypoint (better to anchor on *something* than emit nothing)."""
+    an entrypoint (better to anchor on *something* than emit nothing).
+
+    Drives `reach`, whose question is "did execution get here" -- harness code
+    is legitimately reached, so this stays a soft heuristic. `site` has a
+    stricter rule of its own; see pick_site_frame."""
     for i, fr in enumerate(top_frames):
         func = fr.get("function") or ""
         file_ = fr.get("file") or ""
@@ -82,6 +86,38 @@ def pick_anchor_frame(top_frames: list[dict]) -> tuple[dict | None, int]:
             continue
         return fr, i
     return (top_frames[0], 0) if top_frames else (None, -1)
+
+
+def is_harness_frame(frame: dict) -> bool:
+    """EXACT mirror of the grading oracle's isHarnessFrame (grade.go, ported in
+    native_grader.py:_is_harness_frame). These two MUST stay in lockstep.
+
+    The oracle skips harness frames entirely when matching `site`, so a site
+    anchored on one can never fire no matter how correct it looks -- the bug
+    builds, reproduces, grades 4-of-5 capabilities, and only dies at
+    regrade_verify (stage 17) with everything already built. Keying on the full
+    path is the whole point: libxml2's `api` target crashes at
+    /src/harness/api.c, whose BASENAME (api.c) looks like ordinary library code.
+    """
+    path = frame.get("path") or frame.get("file") or ""
+    return ("/harness/" in path
+            or path.endswith("_fuzzer.c")
+            or path.endswith("_fuzzer.cc"))
+
+
+def pick_site_frame(top_frames: list[dict]) -> tuple[dict | None, int]:
+    """First frame the grading oracle would actually consider for `site`.
+
+    Deliberately has NO fallback to frame 0: if every frame is harness code,
+    this bug's crash site simply is not expressible as a `site` the oracle can
+    match, and saying so here is worth far more than emitting a plausible value
+    that is guaranteed to fail six stages later.
+    """
+    for i, fr in enumerate(top_frames):
+        if is_harness_frame(fr):
+            continue
+        return fr, i
+    return None, -1
 
 
 def derive_class_expected(summary: str | None) -> tuple[str, bool]:
@@ -258,6 +294,7 @@ def main() -> int:
             "raw_trace": top_frames,
             "yaml_draft": "",
             "warnings": warnings,
+            "fatal": None,
         }
         lib.emit(out)
         return 0
@@ -310,12 +347,32 @@ def main() -> int:
         "expected": cls_expected,
         "sanitizer": derive_sanitizer(result.get("sanitizer")),
     }
+    # `site` gets its own anchor, under the oracle's rule rather than reach's
+    # looser one -- the two frames coincide for most bugs and diverge exactly
+    # when the crash lands inside the harness.
+    site_frame, site_idx = pick_site_frame(top_frames)
+    fatal = None
+    if site_frame is None:
+        fatal = (
+            "every symbolized frame is harness code, so no `site` the grading oracle would "
+            "even look at exists for this bug (it skips harness frames outright). Anchoring "
+            "site here would produce an expected.yaml that can never grade solved. Either "
+            "move the crashing logic out of the harness, or drop `site` from this bug's "
+            f"capability_set. Frames seen: {[f.get('path') or f.get('file') for f in top_frames]}"
+        )
     site = {
-        "expected_file": anchor_file,
-        "expected_line": anchor_line,
+        "expected_file": (site_frame or {}).get("file"),
+        "expected_line": (site_frame or {}).get("line"),
         "line_tolerance": args.line_tolerance,
         "max_frame_distance": args.max_frame_distance,
     }
+    if site_frame is not None and site_frame is not anchor:
+        warnings.append(
+            f"site is anchored on frame #{site_idx} ({site_frame.get('path') or site_frame.get('file')}"
+            f":{site_frame.get('line')} in {site_frame.get('function')}), NOT on reach's frame "
+            f"#{anchor_idx} ({anchor_file}:{anchor_line}) -- the frames before it are harness code, "
+            f"which the grading oracle skips when matching site."
+        )
 
     if cls_fallback:
         warnings.append("class.expected derived via raw-summary fallback (no 'on address'/READ/WRITE "
@@ -337,9 +394,13 @@ def main() -> int:
         "raw_trace": top_frames,
         "yaml_draft": yaml_draft,
         "warnings": warnings,
+        # Non-null means the draft is unusable as-is; the pipeline stage raises
+        # on it rather than building a bundle that is guaranteed to fail
+        # regrade_verify.
+        "fatal": fatal,
     }
     lib.emit(out)
-    return 0
+    return 1 if fatal else 0
 
 
 if __name__ == "__main__":

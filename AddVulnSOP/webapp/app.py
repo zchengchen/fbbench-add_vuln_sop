@@ -12,6 +12,7 @@ Local, single-operator tool only: binds to 127.0.0.1, no auth.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -34,6 +35,7 @@ PIPELINE_SCRIPT = ADDVULNSOP_DIR / "pipeline.py"
 
 sys.path.insert(0, str(ADDVULNSOP_DIR))
 from pipeline import STAGE_NAMES  # noqa: E402  (reuse the real stage list, never re-list it here)
+import fetch_oss_fuzz_issue  # noqa: E402  (backs the Fetch button; see /api/fetch-upstream)
 
 # Stage index ranges for the 4 documented phases (see fbbench-add_vuln_sop/README.md).
 PHASES = [
@@ -286,12 +288,41 @@ def bug_page(sub_id: str):
     return send_from_directory(app.static_folder, "bug.html")
 
 
+@app.post("/api/fetch-upstream")
+def fetch_upstream():
+    """Back the Submit form's Fetch button: one URL in, every other field out.
+
+    Runs server-side because the browser cannot read issues.oss-fuzz.com
+    cross-origin, and because the PoC download is a redirect chain that is far
+    easier to follow here. Purely read-only -- it creates no submission, so a
+    fetch that returns something wrong costs the operator nothing but a retry,
+    and every field it fills stays editable by hand.
+    """
+    payload = request.get_json(silent=True) or {}
+    url = (request.form.get("upstream") or payload.get("upstream") or "").strip()
+    if not url:
+        return jsonify({"errors": ["upstream URL is required"]}), 400
+    try:
+        result, poc_bytes = fetch_oss_fuzz_issue.fetch(url)
+    except Exception as e:  # a scraper bound to an undocumented format: never 500 the UI
+        return jsonify({"errors": [f"fetch failed: {e}"]}), 502
+    if not result.get("ok"):
+        return jsonify({"errors": [result.get("error") or
+                                   "could not read that issue -- it may be private, or the "
+                                   "tracker's page format changed"],
+                        "warnings": result.get("warnings") or []}), 502
+    if poc_bytes:
+        result["poc_b64"] = base64.b64encode(poc_bytes).decode("ascii")
+    return jsonify(result)
+
+
 @app.post("/api/bugs")
 def create_bug():
     date = (request.form.get("date") or "").strip()
     upstream = (request.form.get("upstream") or "").strip()
     report = (request.form.get("report") or "").strip()
     bug_id = (request.form.get("bug_id") or "").strip()
+    title = (request.form.get("title") or "").strip()
     poc = request.files.get("poc")
 
     errors = []
@@ -299,6 +330,8 @@ def create_bug():
         errors.append("date is required")
     if not upstream:
         errors.append("upstream URL is required")
+    if not title:
+        errors.append("title is required")
     if not report:
         errors.append("report is required")
     if not bug_id:
@@ -328,7 +361,11 @@ def create_bug():
         d = sub_dir(sub_id)
     d.mkdir(parents=True)
 
-    (d / "report.txt").write_text(f"upstream: {upstream}\ndate: {date}\n\n{report}\n")
+    # `title:` joins the existing upstream/date header lines: parse_report reads
+    # the whole bundle, so the issue's own one-line summary travels with the
+    # report instead of living only in the web UI's metadata.
+    (d / "report.txt").write_text(
+        f"upstream: {upstream}\ndate: {date}\ntitle: {title}\n\n{report}\n")
 
     poc_name = secure_filename(poc.filename)
     poc.save(str(d / poc_name))
@@ -337,6 +374,7 @@ def create_bug():
     meta = {
         "sub_id": sub_id,
         "bug_id": bug_id,
+        "title": title,
         "date": date,
         "upstream": upstream,
         "submitted_at": now,
@@ -369,6 +407,7 @@ def list_bugs():
         out.append({
             "id": meta["sub_id"],
             "bug_id": meta.get("bug_id"),
+            "title": meta.get("title"),
             "date": meta["date"],
             "submitted_at": meta["submitted_at"],
             "poc_filename": meta.get("poc_filename"),
@@ -391,6 +430,7 @@ def get_bug(sub_id: str):
     return jsonify({
         "id": sub_id,
         "bug_id": meta.get("bug_id"),
+        "title": meta.get("title"),
         "date": meta["date"],
         "upstream": meta.get("upstream"),
         "submitted_at": meta["submitted_at"],
