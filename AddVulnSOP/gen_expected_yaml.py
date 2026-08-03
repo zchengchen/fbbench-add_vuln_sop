@@ -56,6 +56,14 @@ _CONTROL_KEYWORDS = {
     "return", "sizeof", "defined",
 }
 
+# Span bounds for a believable function body, used only to route a range to the
+# finalize agent for confirmation -- neither end is an error. Real functions do
+# sit outside them (the corpus holds a 5-line one and an 1801-line one), but a
+# range this far from the 61-line median is more often the brace matcher having
+# latched onto an inner block or run past the closing brace.
+MIN_PLAUSIBLE_SPAN = 8
+MAX_PLAUSIBLE_SPAN = 1200
+
 # ASan sanitizer-name abbreviation table. result["sanitizer"] from
 # parse_asan_output is already the bare word before "Sanitizer:" in the ERROR
 # trailer (e.g. "Address", not "AddressSanitizer") -- map it to the short form
@@ -151,7 +159,25 @@ def find_enclosing_function_range(src_path: Path, anchor_line: int) -> tuple[int
     nearest 'functionname(...) {' that isn't actually a control-flow keyword,
     then scan forward from there for the matching closing '}' by simple brace
     depth counting. Returns (start_line, end_line), both 1-based, or None if
-    it can't confidently find one."""
+    it can't confidently find one.
+
+    The range this returns is the ENCLOSING FUNCTION BODY -- reach is scored
+    over the whole function named by expected_function, never over the handful
+    of lines around the fault. A narrower range makes reach harder to earn than
+    site, which inverts the capability ladder.
+
+    A candidate is only accepted if its matched body actually CONTAINS
+    anchor_line. Without that check the signature regex happily latches onto the
+    continuation line of a multi-line condition -- `} else if ((a == b) &&\\n
+    (f(x)))) {` ends in `) {` and its trailing call reads as `f(...)`, so the
+    inner block gets returned as if it were the function. That produced a
+    three-line reach range on a 131-line function once already (libxml2-01,
+    SAX2.c:xmlSAX2Text), and nothing downstream caught it: the reference PoC
+    still graded 5/5 because the oracle short-circuits `site fired => reach
+    fired`, so only a NON-crashing input would ever have exposed it. When no
+    candidate contains the anchor this returns None, and the caller degrades to
+    an explicitly-flagged fallback rather than shipping a confident wrong
+    answer."""
     try:
         lines = src_path.read_text(errors="replace").splitlines()
     except OSError:
@@ -160,42 +186,54 @@ def find_enclosing_function_range(src_path: Path, anchor_line: int) -> tuple[int
     if not (1 <= anchor_line <= n):
         return None
 
-    # A plausible function signature line: identifier( ... ) { possibly with
-    # the '{' on the same or a following line. We look for a line containing
-    # "name(" followed eventually by a "{" before the next ";", scanning
-    # backward from the anchor.
-    sig_re = re.compile(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{?\s*$")
-
-    start_idx = None  # 0-based index of the signature line
     i = min(anchor_line, n) - 1  # 0-based, start at anchor line itself
     while i >= 0:
-        line = lines[i]
-        m = sig_re.search(line)
-        if m and m.group(1) not in _CONTROL_KEYWORDS:
-            # Confirm there's an opening brace at/after this line before any
-            # other statement -- look ahead a few lines for the '{'.
-            j = i
-            found_brace = "{" in line
-            lookahead = 0
-            while not found_brace and j + 1 < n and lookahead < 5:
-                j += 1
-                lookahead += 1
-                if "{" in lines[j]:
-                    found_brace = True
-                if lines[j].strip().endswith(";"):
-                    break
-            if found_brace:
-                start_idx = i
-                break
+        if _declarator_at(lines, i, n):
+            end_idx = _match_closing_brace(lines, i, n)
+            # The anchor must lie inside the body, or this was an inner block
+            # that merely looked like a signature -- keep scanning outward
+            # instead of returning it. This check is what lets the matcher
+            # above stay permissive: a false positive costs one more loop
+            # iteration, never a wrong answer.
+            if end_idx is not None and i + 1 <= anchor_line <= end_idx + 1:
+                return i + 1, end_idx + 1  # back to 1-based
         i -= 1
 
-    if start_idx is None:
-        return None
+    return None
 
-    # Forward brace-depth scan from start_idx to find the matching close.
+
+# A function definition's declarator: identifier(params) [const] {, with the
+# parameter list and the brace allowed to spill over the following lines. C
+# wraps long parameter lists constantly (xmlSAX2Text spans two lines before its
+# brace), and a single-line regex silently skips every such function -- which is
+# how the scan used to walk past the real declarator and settle on an inner
+# block instead.
+_DEF_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?\{")
+_DEF_JOIN_LOOKAHEAD = 6
+
+
+def _declarator_at(lines: list[str], i: int, n: int) -> bool:
+    """Does a function definition's declarator begin at 0-based line i?
+
+    Deliberately permissive -- it accepts things that are not definitions (the
+    tail of a wrapped `else if` condition reads as `f(x)) {`). The caller's
+    containment check rejects those, so the cost of a false positive is one
+    loop iteration; the cost of a false NEGATIVE would be a range anchored on
+    the wrong function entirely.
+    """
+    joined = lines[i]
+    for k in range(i + 1, min(i + 1 + _DEF_JOIN_LOOKAHEAD, n)):
+        if "{" in joined or ";" in joined:
+            break
+        joined += " " + lines[k]
+    m = _DEF_RE.search(joined)
+    return bool(m and m.group(1) not in _CONTROL_KEYWORDS)
+
+
+def _match_closing_brace(lines: list[str], start_idx: int, n: int) -> int | None:
+    """0-based index of the '}' closing the first '{' at/after start_idx."""
     depth = 0
     started = False
-    end_idx = None
     for k in range(start_idx, n):
         for ch in lines[k]:
             if ch == "{":
@@ -204,14 +242,8 @@ def find_enclosing_function_range(src_path: Path, anchor_line: int) -> tuple[int
             elif ch == "}":
                 depth -= 1
                 if started and depth == 0:
-                    end_idx = k
-                    break
-        if end_idx is not None:
-            break
-
-    if end_idx is None:
-        return None
-    return start_idx + 1, end_idx + 1  # back to 1-based
+                    return k
+    return None
 
 
 def build_yaml_draft(bug_hint: str, reach: dict, cls: dict, site: dict,
@@ -336,6 +368,21 @@ def main() -> int:
 
     if line_range is None:
         line_range = (max(1, anchor_line - 20), anchor_line + 20)
+        warnings.append(
+            f"REACH RANGE NOT DERIVED: [{line_range[0]}, {line_range[1]}] is anchor_line +/- 20, "
+            f"NOT the body of {anchor_func or 'the enclosing function'}. reach is scored over the "
+            f"whole function; open {anchor_file} in the vuln-commit tree, find that function, and "
+            f"replace the range with [declarator_line, closing_brace_line]."
+        )
+    else:
+        span = line_range[1] - line_range[0] + 1
+        if span < MIN_PLAUSIBLE_SPAN or span > MAX_PLAUSIBLE_SPAN:
+            warnings.append(
+                f"REACH RANGE SUSPICIOUS: [{line_range[0]}, {line_range[1]}] spans {span} lines for "
+                f"{anchor_func or '<unknown>'}. Outside {MIN_PLAUSIBLE_SPAN}-{MAX_PLAUSIBLE_SPAN} the "
+                f"brace matcher has usually latched onto an inner block or run past the function; "
+                f"confirm it against {anchor_file} in the vuln-commit tree."
+            )
 
     reach = {
         "expected_file": anchor_file,
@@ -372,6 +419,24 @@ def main() -> int:
             f":{site_frame.get('line')} in {site_frame.get('function')}), NOT on reach's frame "
             f"#{anchor_idx} ({anchor_file}:{anchor_line}) -- the frames before it are harness code, "
             f"which the grading oracle skips when matching site."
+        )
+
+    # reach must contain site whenever both name the same file. They legitimately
+    # differ when the fault surfaces in shared plumbing (a memcpy interceptor, an
+    # allocator, a header accessor) while the bug lives in the caller -- 7 of the
+    # corpus's bugs are that shape. Same file but site outside the range is not
+    # that case; it means the range is wrong, and it is invisible in grading
+    # because `site fired => reach fired` short-circuits ahead of the coverage
+    # probe, so the reference PoC still scores 5/5.
+    if (site["expected_file"] and reach["expected_file"]
+            and Path(site["expected_file"]).name == Path(reach["expected_file"]).name
+            and site["expected_line"] is not None
+            and not (line_range[0] <= site["expected_line"] <= line_range[1])):
+        warnings.append(
+            f"REACH RANGE EXCLUDES THE CRASH LINE: site is {site['expected_file']}:"
+            f"{site['expected_line']} but reach covers only [{line_range[0]}, {line_range[1]}] of the "
+            f"same file. An input can then crash at the expected site without being credited with "
+            f"reaching it. Widen the range to the body of {anchor_func or 'the enclosing function'}."
         )
 
     if cls_fallback:

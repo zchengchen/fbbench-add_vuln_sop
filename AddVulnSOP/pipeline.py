@@ -1158,7 +1158,23 @@ def stage_gen_expected_yaml(ctx: Ctx, state: dict) -> dict:
     return {"data": draft}
 
 
-FINALIZE_EXPECTED_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+FINALIZE_EXPECTED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "boolean"},
+        # What the agent actually wrote for reach.expected_line_range, after
+        # checking it against the vuln-commit source, plus whether that differed
+        # from the generator's draft. A correction here is a SUCCESS, not a
+        # failure: the deterministic brace matcher is best-effort by design and
+        # the agent is the backstop. Recorded so a bundle's provenance shows
+        # which ranges were machine-derived and which were repaired.
+        "reach_line_range": {"type": "array", "items": {"type": "integer"},
+                             "minItems": 2, "maxItems": 2},
+        "reach_range_corrected": {"type": "boolean"},
+        "reach_range_note": {"type": "string"},
+    },
+    "required": ["ok", "reach_line_range", "reach_range_corrected"],
+}
 
 
 def stage_finalize_expected_yaml(ctx: Ctx, state: dict) -> dict:
@@ -1182,11 +1198,37 @@ If warnings indicate missing file/line/function data, you may re-derive by readi
 and the source at {vuln_src_dir} (that tree is checked out at the exact commit this bug's binaries were \
 built from, so its line numbers line up with the trace), but never fabricate a plausible-sounding line \
 number.
-raw_trace: {json.dumps(draft.get('raw_trace'))}"""
+raw_trace: {json.dumps(draft.get('raw_trace'))}
+
+ONE VALUE IS YOURS TO CHECK AND FIX: reach.expected_line_range. Everything else above is read straight \
+off the trace and is right by construction; this one is produced by brace matching over source text, \
+which is best-effort and has shipped a wrong answer before. You are the backstop, so verify it rather \
+than copying it:
+
+1. Open {draft['reach'].get('expected_file')} under {vuln_src_dir} and find the definition of \
+{draft['reach'].get('expected_function')}.
+2. The range must be that function's WHOLE BODY: first line of its declarator (the line the function \
+name is on, not the line above holding the return type) through the line of its closing brace. reach is \
+scored by running the coverage build and asking whether any executed line falls in this range, so a \
+range narrower than the body makes reach harder to earn than site and inverts the capability ladder.
+3. Confirm the crash line ({draft['site'].get('expected_line')}) falls inside it when \
+{draft['site'].get('expected_file')} is the same file as the reach file. If they are different files -- \
+the fault surfacing in an allocator or a header accessor while the bug lives in the caller -- that is \
+legitimate and no containment is required.
+4. If the draft range is wrong, WRITE THE CORRECTED ONE. That is the expected outcome of finding a \
+mismatch, not an error to report: fix it, write the file, and return ok=true.
+
+Report in your structured output: reach_line_range (the two numbers you actually wrote), \
+reach_range_corrected (true if they differ from the draft's \
+{draft['reach'].get('expected_line_range')}), and reach_range_note (one line: the function's real extent \
+and why you kept or changed the range)."""
 
     out = call_agent(
         prompt, cwd=bug_dir,
-        allowed_tools=["Read", "Write"],
+        # Glob/Grep so the agent can locate expected_file in the vintage tree --
+        # the trace carries a basename, not a path, and Read alone cannot find
+        # it. Both are read-only.
+        allowed_tools=["Read", "Write", "Glob", "Grep"],
         model=ctx.model,
         json_schema=FINALIZE_EXPECTED_SCHEMA,
         timeout_s=300,
@@ -1194,7 +1236,14 @@ raw_trace: {json.dumps(draft.get('raw_trace'))}"""
     )
     if not (bug_dir / "grader" / "expected.yaml").is_file():
         raise RuntimeError(f"finalize_expected_yaml: expected.yaml not written: {out['result']!r}")
-    return {"data": out["structured_output"] or {"ok": True}, "cost_usd": out["cost_usd"]}
+    data = out["structured_output"] or {"ok": True}
+    # A repaired range is the backstop working, so this stage does not fail on
+    # it -- it only says so, loudly enough that a reviewer can spot a bug whose
+    # range the brace matcher could not derive.
+    if data.get("reach_range_corrected"):
+        print(f"[fixed] finalize_expected_yaml: reach range {draft['reach'].get('expected_line_range')}"
+              f" -> {data.get('reach_line_range')}  ({data.get('reach_range_note', '')})")
+    return {"data": data, "cost_usd": out["cost_usd"]}
 
 
 # ---------------------------------------------------------------------------
