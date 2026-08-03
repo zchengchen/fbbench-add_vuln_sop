@@ -1420,31 +1420,41 @@ def stage_scaffold_public_repo(ctx: Ctx, state: dict) -> dict:
     (pub_dir / "harness").mkdir(exist_ok=True)
 
     language = hm.get("language") or report.get("language") or "c"
-    # Derived from the harness descriptor the scaffold agent reported.
-    # build_system/entrypoint/rss are best-effort -- verify them in review.
-    pub_bench = {
-        "bug_id": alias,
-        "project": project,
-        "target": {
-            "language": language,
-            "build_system": hm.get("build_system") or "unknown",
-        },
-        "harness": {
-            "type": hm.get("harness_type") or ("java" if language == "jvm" else "libfuzzer"),
-            "entrypoint": hm.get("entrypoint") or "LLVMFuzzerTestOneInput",
-            "invocation": hm.get("invocation") or ["@@"],
-            "rss_limit_mb": hm.get("rss_limit_mb") or 256,
-            "timeout_s": hm.get("timeout_s") or 30,
-            "provenance": hm.get("provenance") or "oss-fuzz",
-            "sanitizer": hm.get("sanitizer") or report.get("sanitizer") or "asan",
-        },
-        "reproducibility": {
-            "base_image_digest": "",
-            "snapshot_debian_date": "20260101T000000Z",
-            "source_date_epoch": 1735689600,
-        },
-    }
-    lib.write_yaml(pub_dir / "bench.yaml", pub_bench)
+    # The answer-free 5-field format the public repo migrated to in f3a26be
+    # ("bench.yaml: migrate all 69 challenges ...", 2026-07-29). Shape it exactly
+    # the way fbbench/grading/bench_yaml.py reads it, because that reader is
+    # deliberately minimal and silently ignores anything it does not expect:
+    # read_bench() takes ONLY top-level scalars and one-line [lists] (it skips
+    # every indented line), and harness_sanitizer() is a special case that walks
+    # into the `harness:` block for `sanitizer` alone.
+    #
+    # So nesting is not a stylistic choice here. `language` under a `target:`
+    # block is invisible; `capability_set` omitted makes capability_set() fall
+    # back to the full default ladder WITHOUT a word of warning, which would
+    # silently grade a bug on capabilities it was never meant to be scored on
+    # (sweep/orchestrator.py, sweep/claudecode.py, tools/sealed/verify_sealed.py,
+    # tools/sealed/verify_canonical.py all take that fallback).
+    # Written as text rather than via lib.write_yaml, because PyYAML's default
+    # block style is not merely a cosmetic mismatch here: read_bench() only
+    # recognizes a list written on ONE line as `[a, b]`. Dumped as a block list
+    # ("capability_set:" then "- class" ...) it parses to '' -- falsy -- and the
+    # caller silently takes the default-ladder fallback. Verified against the
+    # reader both ways before choosing this.
+    invocation = hm.get("invocation") or ["@@"]
+    pub_bench = "\n".join([
+        f"bug_id: {alias}",
+        f"project: {project}",
+        f"is_oss_fuzz: {'true' if hm.get('is_oss_fuzz', True) else 'false'}",
+        f"language: {language}",
+        "harness:",
+        f"  sanitizer: {hm.get('sanitizer') or report.get('sanitizer') or 'asan'}",
+        f"  engine: {hm.get('engine') or ('jazzer' if language == 'jvm' else 'libfuzzer')}",
+        "  invocation: [" + ", ".join(f'"{a}"' for a in invocation) + "]",
+        "",
+        "capability_set: [" + ", ".join(CAPABILITY_SET) + "]",
+        "",
+    ])
+    (pub_dir / "bench.yaml").write_text(pub_bench)
 
     # Public bug dir carries the harness SOURCE (harness/) plus build.sh (the
     # answers build/build.sh copied to the public harness/build.sh, matching the
