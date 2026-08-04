@@ -30,6 +30,24 @@ function bugIdFromPath() {
   return decodeURIComponent(parts[parts.length - 1] || "");
 }
 
+function captureLogState(root) {
+  const box = $("details.log-box", root);
+  if (!box) return null;
+  const pre = $("pre", box);
+  // Whether the view is pinned to the bottom has to be decided before the
+  // swap, so a live tail keeps following new lines instead of freezing at an
+  // offset that is stale the moment more output arrives.
+  const atBottom = !pre || pre.scrollHeight - pre.scrollTop - pre.clientHeight < 8;
+  return { open: box.open, scrollTop: pre ? pre.scrollTop : 0, atBottom };
+}
+
+function restoreLogState(root, prev) {
+  if (!prev || !prev.open) return;
+  const pre = $("details.log-box pre", root);
+  if (!pre) return;
+  pre.scrollTop = prev.atBottom ? pre.scrollHeight : prev.scrollTop;
+}
+
 function renderDetail(d) {
   const detail = $("#bug-detail");
   const label = d.bug_id || d.id;
@@ -46,6 +64,14 @@ function renderDetail(d) {
   // The stage list already carries each stage's index, so the restart label
   // can name the position as well as the stage.
   const resumeIdx = (d.stages.find((s) => s.name === d.resume_stage) || {}).index;
+
+  // The 4s poll re-renders this whole pane, which would otherwise slam the log
+  // box shut and jump it back to the top on every tick -- exactly while a run
+  // is live and the log is the thing worth reading. Carry the reader's own
+  // open/scroll state across the swap; the failed-run default below only
+  // applies on the first render, when there is no prior state to carry.
+  const prevLog = captureLogState(detail);
+  const logOpen = prevLog ? prevLog.open : d.overall_status === "failed";
 
   detail.innerHTML = `
     <div class="detail-head">
@@ -103,11 +129,13 @@ function renderDetail(d) {
       </div>
     `).join("")}
 
-    <details class="log-box" ${d.overall_status === "failed" ? "open" : ""}>
+    <details class="log-box" ${logOpen ? "open" : ""}>
       <summary>run.log (tail)</summary>
       <pre>${escapeHtml(d.log_tail || "(empty)")}</pre>
     </details>
   `;
+
+  restoreLogState(detail, prevLog);
 
   const cancelBtn = $("#cancel-btn");
   if (cancelBtn) {
