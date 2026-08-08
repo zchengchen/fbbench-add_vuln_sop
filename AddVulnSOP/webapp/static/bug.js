@@ -1,9 +1,8 @@
-const PHASES = [
-  { letter: "A", lo: 0, hi: 4, title: "Parse & locate the commits" },
-  { letter: "B", lo: 5, hi: 11, title: "Harness, both builds, corpus cleanliness" },
-  { letter: "C", lo: 12, hi: 16, title: "Generate the answer & challenge files" },
-  { letter: "D", lo: 17, hi: 20, title: "Verify, ship the image, commit" },
-];
+// Phases come from the API (d.phases), not from a copy here. This file used
+// to carry its own hardcoded bounds, which are only correct for one particular
+// stage list: the moment a stage was added or removed they silently went stale
+// and the page kept rendering ranges for a pipeline that no longer existed.
+// Stage numbers shown to the operator are 1-based; the server renumbers them.
 
 let pollTimer = null;
 
@@ -56,9 +55,19 @@ function renderDetail(d) {
   // it. Older runs carry no title and keep showing just the id.
   $("#page-title").textContent = d.title ? `${d.title} (${label})` : label;
 
-  const stagesByPhase = PHASES.map((ph) => ({
+  // Fall back to one unlabelled group when the server sends no phases. A
+  // long-running server process keeps the app.py it started with, while this
+  // file is re-read from disk on every request -- so a restart-less deploy can
+  // pair new JS with an old payload. Without this the page rendered nothing at
+  // all, which looks like "the run has no stages" rather than "reload me".
+  const phases = (d.phases || []).length
+    ? d.phases
+    : [{ letter: null, lo: 1, hi: d.stages.length, title: "" }];
+  const stagesByPhase = phases.map((ph) => ({
     ...ph,
-    stages: d.stages.filter((s) => s.phase === ph.letter),
+    stages: ph.letter === null
+      ? d.stages
+      : d.stages.filter((s) => s.phase === ph.letter),
   }));
 
   // The stage list already carries each stage's index, so the restart label

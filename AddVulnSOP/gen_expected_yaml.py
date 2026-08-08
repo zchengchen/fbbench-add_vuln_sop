@@ -102,8 +102,8 @@ def is_harness_frame(frame: dict) -> bool:
 
     The oracle skips harness frames entirely when matching `site`, so a site
     anchored on one can never fire no matter how correct it looks -- the bug
-    builds, reproduces, grades 4-of-5 capabilities, and only dies at
-    regrade_verify (stage 17) with everything already built. Keying on the full
+    builds and reproduces, and the mis-anchored value goes unnoticed into the
+    archived expected.yaml with everything already built. Keying on the full
     path is the whole point: libxml2's `api` target crashes at
     /src/harness/api.c, whose BASENAME (api.c) looks like ordinary library code.
     """
@@ -459,9 +459,9 @@ def main() -> int:
         "raw_trace": top_frames,
         "yaml_draft": yaml_draft,
         "warnings": warnings,
-        # Non-null means the draft is unusable as-is; the pipeline stage raises
-        # on it rather than building a bundle that is guaranteed to fail
-        # regrade_verify.
+        # Non-null means the draft could not be anchored. expected.yaml is
+        # archival now, so the pipeline stage downgrades this to a warning
+        # rather than ending the run -- see stage_gen_expected_yaml.
         "fatal": fatal,
     }
     lib.emit(out)

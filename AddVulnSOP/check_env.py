@@ -4,22 +4,20 @@
 Two tiers:
 
   REQUIRED -- the run is blocked without it. This covers both the loud
-    dependencies (no git/docker/claude/curl and stage 1 dies immediately) AND
-    the quiet ones, which matter more: without llvm-symbolizer the ASan
-    backtrace carries no file:line, so `site` and `reach` simply never fire;
-    without the llvm-14-matched profdata/cov the coverage profile fails to
-    merge and `reach` never fires. Neither prints an error -- you just get a
-    bug that grades as unsolved for no visible reason, hours in. Cheap to
-    check up front, expensive to debug later.
+    dependencies (no git/docker/claude and clone_upstream dies immediately)
+    AND the quiet one, which matters more: without llvm-symbolizer the ASan
+    backtrace carries no file:line, so the signature rules have no frames to
+    name the crash by and it lands in the pool as `<unsigned>`. That prints
+    no error -- the bug still crashes, it just stops counting as a distinct
+    find. Cheap to check up front, expensive to debug later.
 
   ADVISORY -- reported, never blocks: things that only bite some runs
     (a dirty repo working tree, low disk, Flask for the webapp).
 
-Probes RUN each tool rather than just `which`-ing it. llvm-profdata-14 in
-particular is typically a wrapper script that exports LD_LIBRARY_PATH before
-exec'ing the real binary (that's what ensure_llvm14.py installs) -- `which`
-finds the wrapper even when the binary underneath is gone. It also rejects
-`--version` outright ("Unknown command!"), so the probe uses a subcommand.
+Probes RUN each tool rather than just `which`-ing it: a tool on PATH is
+often a wrapper script that sets up an environment before exec'ing the real
+binary, and `which` finds the wrapper even when the binary underneath is
+gone.
 
 Usage:
     check_env.py [--json] [--answers-repo P] [--public-repo P] [--oss-fuzz-repo P]
@@ -89,15 +87,19 @@ def run_checks(answers_repo: Path, public_repo: Path, oss_fuzz_repo: Path) -> di
     # -- loud external tools ------------------------------------------------
     checks.append(_check_tool(
         "git", ["git", "--version"], REQUIRED,
-        "stage 1 clones upstream; stage 20 commits both repos",
+        "clone_upstream clones upstream; commit_locally commits both repos",
         "apt install git"))
+    # Was REQUIRED for corpus_scan's ClusterFuzz download. That stage is gone
+    # and no pipeline code shells out to curl any more (fetch_oss_fuzz_issue.py
+    # uses urllib), but the agent stages have Bash and may still reach for it,
+    # so it is reported rather than dropped or blocked on.
     checks.append(_check_tool(
-        "curl", ["curl", "--version"], REQUIRED,
-        "stage 8 downloads the ClusterFuzz corpus",
+        "curl", ["curl", "--version"], ADVISORY,
+        "no pipeline code calls it; agent stages with Bash may still use it",
         "apt install curl"))
     checks.append(_check_tool(
         "docker", ["docker", "--version"], REQUIRED,
-        "every build stage, the image audit, and the llvm-14/mcp-server helpers",
+        "every build stage, the image audit, and the mcp-server helper",
         "install Docker"))
     checks.append(_check_tool(
         "docker daemon", ["docker", "info", "--format", "{{.ServerVersion}}"], REQUIRED,
@@ -105,26 +107,21 @@ def run_checks(answers_repo: Path, public_repo: Path, oss_fuzz_repo: Path) -> di
         "start Docker, and make sure this user is in the `docker` group"))
     checks.append(_check_tool(
         "claude CLI", ["claude", "--version"], REQUIRED,
-        "the 8 agent-driven stages (parse_report, find_fix_commit, scaffold_harness, …)",
+        "the 6 agent-driven stages (parse_report, resolve_vuln_commit, scaffold_harness, …)",
         "install the claude CLI and log in (`claude` once, interactively)"))
 
     # -- quiet ones: these fail by producing a wrong RESULT, not an error ----
     checks.append(_check_tool(
         "llvm-symbolizer", ["llvm-symbolizer", "--version"], REQUIRED,
-        "symbolizes ASan frames. Missing -> frames have no file:line -> `site` and "
-        "`reach` silently never fire and the bug grades unsolved",
+        "symbolizes ASan frames. Missing -> frames have no file:line, so the "
+        "signature rules have nothing to name the crash by and every crash in "
+        "the pool collapses onto `<unsigned>` -- silently, since it still crashes",
         "apt install llvm  (or point ASAN_SYMBOLIZER_PATH at one)"))
-    # NOT --version: llvm-profdata rejects it outright ("Unknown command!").
-    checks.append(_check_tool(
-        "llvm-profdata-14", ["llvm-profdata-14", "show", "--help"], REQUIRED,
-        "merges the coverage profile for `reach`. The coverage binaries are built "
-        "with clang-14 (profile format v8); a newer host llvm cannot read them and "
-        "`reach` silently never fires",
-        "python3 AddVulnSOP/ensure_llvm14.py   (extracts llvm-14 via docker)"))
-    checks.append(_check_tool(
-        "llvm-cov-14", ["llvm-cov-14", "--version"], REQUIRED,
-        "exports the merged profile for `reach` -- same clang-14 ABI constraint",
-        "python3 AddVulnSOP/ensure_llvm14.py"))
+    # llvm-profdata-14 / llvm-cov-14 used to be REQUIRED here. They read the
+    # clang-14 coverage profile, which existed for one consumer: the `reach`
+    # rung. No coverage binary is built any more and no rung reads it, so
+    # requiring them blocked a run on a capability the pipeline no longer has
+    # -- and pointed at ensure_llvm14.py, which is gone with them.
 
     # -- workspace ----------------------------------------------------------
     for label, path, extra in (
@@ -139,15 +136,9 @@ def run_checks(answers_repo: Path, public_repo: Path, oss_fuzz_repo: Path) -> di
             "clone it next to this repo, or pass --answers-repo/--public-repo/--oss-fuzz-repo",
             "resolved by walking up for the dir holding both bench repos"))
 
-    # -- advisory -----------------------------------------------------------
-    # dpkg-deb only matters as the REMEDY path for llvm-14; if the llvm-14
-    # tools already work, its absence is irrelevant, so don't block on it.
-    llvm14_ok = all(c["ok"] for c in checks if c["name"] in ("llvm-profdata-14", "llvm-cov-14"))
-    checks.append(_check_tool(
-        "dpkg-deb", ["dpkg-deb", "--version"], ADVISORY if llvm14_ok else REQUIRED,
-        "only used by ensure_llvm14.py to unpack the llvm-14 debs"
-        + (" — not needed, llvm-14 already works" if llvm14_ok else ""),
-        "apt install dpkg  (or install llvm-14 by hand)"))
+    # dpkg-deb was checked here only as the remedy path for llvm-14 (it
+    # unpacked the debs ensure_llvm14.py fetched). Both are gone, and nothing
+    # else in the pipeline unpacks a .deb.
 
     for label, repo in (("answers repo", answers_repo), ("public repo", public_repo)):
         if not (repo / ".git").is_dir():
@@ -173,7 +164,7 @@ def run_checks(answers_repo: Path, public_repo: Path, oss_fuzz_repo: Path) -> di
         checks.append(_result(
             f"{label} tree", ADVISORY, on_main and not modified, ", ".join(bits),
             "switch back to main / commit or stash tracked edits",
-            "stage 20 refuses to branch from anything but the default branch, and "
+            "commit_locally refuses to branch from anything but the default branch, and "
             "tracked edits sitting here can end up in a bug's commit"))
 
     try:

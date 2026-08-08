@@ -2,7 +2,7 @@
 """Local web UI for the fbbench add_vuln SOP.
 
 Lets an operator submit a new bug (date + report text + PoC upload) and
-watch it move through the same 21 pipeline.py stages, instead of hand-
+watch it move through the same pipeline.py stages, instead of hand-
 crafting a report-dir and running the CLI. Submitting a bug auto-starts the
 real `pipeline.py run` as a background subprocess -- this WILL shell out to
 docker/git/claude and can run for hours and incur billed API usage.
@@ -37,20 +37,64 @@ sys.path.insert(0, str(ADDVULNSOP_DIR))
 from pipeline import STAGE_NAMES  # noqa: E402  (reuse the real stage list, never re-list it here)
 import fetch_oss_fuzz_issue  # noqa: E402  (backs the Fetch button; see /api/fetch-upstream)
 
-# Stage index ranges for the 4 documented phases (see fbbench-add_vuln_sop/README.md).
-PHASES = [
-    ("A", 0, 4),
-    ("B", 5, 11),
-    ("C", 12, 16),
-    ("D", 17, 20),
+# The 4 documented phases (see fbbench-add_vuln_sop/README.md), each named by
+# the stage it STARTS at.
+#
+# These were index ranges once -- ("A", 0, 4), ("B", 5, 11) and so on. Index
+# ranges are only correct for one particular stage list: removing a stage
+# shifts every later index and silently reassigns the phases (a build stage
+# starts rendering under "verify"), with nothing to fail. Anchoring on names
+# means a removed boundary stage is a loud KeyError here instead.
+PHASE_STARTS = [
+    ("A", "parse_report",       "Parse the report & locate the vulnerable commit"),
+    ("B", "scaffold_harness",   "Harness and the ASan build"),
+    ("C", "gen_expected_yaml",  "Generate the answer & challenge files"),
+    ("D", "verify_signature",   "Verify, ship the image, commit"),
 ]
 
 
+def _phase_bounds() -> list[tuple[str, int, int, str]]:
+    starts = []
+    for letter, stage, title in PHASE_STARTS:
+        if stage not in STAGE_NAMES:
+            raise KeyError(
+                f"phase {letter} starts at stage {stage!r}, which is not in the pipeline's "
+                f"stage list -- update PHASE_STARTS to match pipeline.STAGES")
+        starts.append((letter, STAGE_NAMES.index(stage), title))
+    bounds = []
+    for i, (letter, lo, title) in enumerate(starts):
+        hi = starts[i + 1][1] - 1 if i + 1 < len(starts) else len(STAGE_NAMES) - 1
+        bounds.append((letter, lo, hi, title))
+    return bounds
+
+
+PHASES = _phase_bounds()
+
+
 def phase_for(index: int) -> str:
-    for letter, lo, hi in PHASES:
+    """Phase letter for a ZERO-based stage index (the position in STAGE_NAMES).
+
+    Display numbering is 1-based and applied at the API boundary only -- see
+    phases_payload() and stage_status_list(). Keeping the internal index
+    0-based means it still lines up with STAGE_NAMES, so the two numbering
+    schemes can't drift into each other.
+    """
+    for letter, lo, hi, _title in PHASES:
         if lo <= index <= hi:
             return letter
     return "?"
+
+
+def phases_payload() -> list[dict]:
+    """Phase bounds for the UI, renumbered 1-based.
+
+    Served rather than duplicated in JS: the page used to carry its own copy of
+    these bounds, which silently went stale the moment a stage was added or
+    removed -- it kept rendering "stage 17-20" for a pipeline that no longer
+    had 21 stages. Derived here, there is one definition and it cannot drift.
+    """
+    return [{"letter": letter, "lo": lo + 1, "hi": hi + 1, "title": title}
+            for letter, lo, hi, title in PHASES]
 
 
 app = Flask(__name__, static_folder=str(WEBAPP_DIR / "static"), static_url_path="")
@@ -136,12 +180,18 @@ def resume_stage(state: dict | None) -> str | None:
     for name in STAGE_NAMES:
         if stages.get(name, {}).get("status") != "done":
             return name
-    return None  # all 21 done, nothing to resume
+    return None  # every stage done, nothing to resume
 
 
 def resolve_bug_id(meta: dict, state: dict | None) -> str | None:
-    """meta is authoritative, but submissions created before the Bug ID field
-    existed don't have it -- fall back to what compute_alias recorded."""
+    """meta is authoritative for anything submitted through this form.
+
+    The fallback reads a stage that no longer exists: `compute_alias` recorded
+    the id it derived, back when ids were derived. It is kept because old
+    submissions on disk still have that stage in their state file, and this is
+    the only place their bug id survives -- for runs since, --bug-id is
+    required and meta always carries it, so the fallback never fires.
+    """
     if meta.get("bug_id"):
         return meta["bug_id"]
     ca = ((state or {}).get("stages", {}).get("compute_alias") or {}).get("data") or {}
@@ -240,7 +290,8 @@ def stage_status_list(state: dict, running_process_alive: bool) -> list[dict]:
                 status = "running" if running_process_alive else "pending"
             else:
                 status = "pending"
-        result.append({"index": i, "name": name, "phase": phase_for(i), "status": status})
+        # index is 1-based for display; phase_for() takes the 0-based position.
+        result.append({"index": i + 1, "name": name, "phase": phase_for(i), "status": status})
     return result
 
 
@@ -438,10 +489,11 @@ def get_bug(sub_id: str):
         "pid_alive": alive,
         "overall_status": overall_status(meta, state, alive),
         "stages": stage_status_list(state or {"stages": {}}, alive),
+        "phases": phases_payload(),
         "log_tail": tail_lines(d / "run.log"),
         # What a Restart would do, computed here so the page doesn't have to
-        # reimplement it. resume_bug_id is null for a run that died before
-        # compute_alias ever recorded one -- the UI asks for it in that case.
+        # reimplement it. resume_bug_id is null for an old run that died
+        # before its id was ever recorded -- the UI asks for it in that case.
         "resume_stage": resume_stage(state),
         "resume_bug_id": resolve_bug_id(meta, state),
         # A queued run is already going to start on its own -- offering
