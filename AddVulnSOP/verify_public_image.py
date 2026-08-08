@@ -50,6 +50,27 @@ def _run(cmd: list[str], timeout: int = 300) -> tuple[str, str, int, bool]:
     return stdout, stderr, rc, is_cli_error
 
 
+def _inspect(image: str, go_template: str) -> str:
+    """One `docker inspect -f` value, or "" if it can't be read.
+
+    Deliberately read from the image CONFIG, not from inside a container: env
+    vars and labels are what a remote-graded build differs by, and a container
+    would show a merged environment rather than what the image itself declares.
+    """
+    stdout, _, rc, _ = _run(["docker", "inspect", "-f", go_template, image], timeout=60)
+    return stdout.strip() if rc == 0 else ""
+
+
+def _inspect_env(image: str, key: str) -> str:
+    """The image's declared value for one env var, or "" when unset."""
+    raw = _inspect(image, "{{range .Config.Env}}{{println .}}{{end}}")
+    for line in raw.splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name.strip() == key:
+            return value.strip()
+    return ""
+
+
 def docker_bash(image: str, script: str, timeout: int = 300) -> tuple[list[str], bool, str]:
     """Run `bash -c <script>` inside `image`. Returns (nonblank stdout lines, error, stderr)."""
     stdout, stderr, rc, is_cli_error = _run(["docker", "run", "--rm", image, "bash", "-c", script], timeout)
@@ -57,14 +78,26 @@ def docker_bash(image: str, script: str, timeout: int = 300) -> tuple[list[str],
     return lines, is_cli_error, stderr
 
 
-# The five things every challenge image must ship. `kind` picks the test:
+# The things every challenge image must ship. `kind` picks the test:
 # "dir" = exists and holds at least one file; "file" = exists as a file.
+#
+# The oracle harness is on this list for a reason the other five are not: its
+# absence does not break the image, it CHANGES it. build_challenge.py falls
+# back to a remote-graded image when that binary is missing, and the fallback
+# is silent -- same /challenge layout, same role/bug labels, same everything
+# this probe used to look at. The only outward difference is this file, the
+# BENCH_ORACLE_DIR env var, and the fbbench.grading label, so all three are
+# checked; a self-contained image that quietly ships as a remote-graded one is
+# exactly the defect that survives a structural audit.
+ORACLE_HARNESS = "/opt/fbbench/oracle/binaries/vuln/asan/harness"
+
 REQUIRED = [
     ("/challenge/src", "dir"),
     ("/challenge/harness", "dir"),
     ("/challenge/bench.yaml", "file"),
     ("/challenge/description.txt", "file"),
     ("/usr/local/bin/mcp-server", "file"),
+    (ORACLE_HARNESS, "file"),
 ]
 
 
@@ -99,10 +132,29 @@ def verify(image: str, fresh_pull: bool = False) -> dict:
     structure = {path: counts.get(path, 0) for path, _ in REQUIRED}
     missing = [path for path, _ in REQUIRED if counts.get(path, 0) <= 0]
 
+    # The other two halves of "is this actually a local-grading image". Read
+    # from the image config rather than from inside the container, because that
+    # is where a remote-graded build differs: it sets BENCH_GRADE_URL and
+    # leaves fbbench.grading="remote".
+    grading = _inspect(image, '{{index .Config.Labels "fbbench.grading"}}')
+    oracle_dir = _inspect_env(image, "BENCH_ORACLE_DIR")
+    grade_url = _inspect_env(image, "BENCH_GRADE_URL")
+
+    if grading != "local":
+        errors.append(f'fbbench.grading is {grading!r}, expected "local" -- this image grades REMOTELY')
+    if not oracle_dir:
+        errors.append("BENCH_ORACLE_DIR is unset -- the in-image oracle will never be found")
+    if grade_url:
+        errors.append(f"BENCH_GRADE_URL is set to {grade_url!r} -- a self-contained image must not "
+                      f"carry a remote endpoint")
+
     ok = not missing and not errors
     return {
         "structure": structure,
         "missing": missing,
+        "grading": grading,
+        "oracle_dir": oracle_dir,
+        "grade_url": grade_url,
         "errors": errors,
         "ok": ok,
     }
