@@ -1388,8 +1388,23 @@ def stage_commit_locally(ctx: Ctx, state: dict) -> dict:
     bug_id = bug_dir_for(ctx, state).name
     branch_name = f"newbug/{bug_id}"
 
-    ans_msg = f"Add {bug_id} bug bundle ({report['short_title']})"
-    pub_msg = f"Add {public_alias} challenge ({report['short_title']})"
+    # The message is the bug id and NOTHING else -- no crash class, no faulting
+    # function, no upstream title, no file or line.
+    #
+    # These messages used to carry `short_title`, which is the OSS-Fuzz issue
+    # summary and reads like "libxml2:html: Heap-buffer-overflow in
+    # xmlSAX2Text" -- the crash class and the faulting function, i.e. most of
+    # what the challenge is asking the solver to find. A commit message is not
+    # covered by any of the scrubbing that protects the bundle: build_challenge
+    # audits the files that go into the image, but `git log` sits outside that
+    # boundary entirely and survives every later rebase, cherry-pick and
+    # mirror. Leaking there leaks permanently and to anyone with the repo.
+    #
+    # So this is a fixed format with a single interpolation, not a template
+    # someone can extend later: an id-only subject cannot leak by accident,
+    # and any new field is a deliberate edit to this line.
+    ans_msg = f"Add {bug_id}"
+    pub_msg = f"Add {public_alias}"
 
     results = {}
     for repo, rel_paths, msg, key, force_paths in (
